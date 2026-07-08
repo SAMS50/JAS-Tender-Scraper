@@ -1,0 +1,109 @@
+"""
+Keyword filtering for IT / software / AI tenders.
+
+Why a strict matcher is needed
+------------------------------
+GeM's server-side `fullText` search is a TOKEN-OR match, not a phrase match:
+searching "machine learning" returns 167k bids (matching "machine" OR
+"learning" — e.g. grinding wheels), and "face recognition" returns paint and
+brooms. So we can only use server search to *shrink* the candidate set; the real
+filtering must happen here, with word-boundary / phrase-aware regexes.
+
+Each keyword becomes a regex that:
+  * treats spaces and hyphens as interchangeable separators
+    ("AI-based" matches "ai based" and "ai-based"),
+  * allows an optional trailing plural "s" ("chatbot" matches "chatbots"),
+  * is anchored on non-alphanumeric boundaries so short tokens don't over-match
+    ("app" matches "web app" but NOT "apparel"; "vision" does NOT match
+    "supervision").
+"""
+
+from __future__ import annotations
+
+import re
+
+# The user's target keyword list (deduplicated, whitespace-trimmed).
+KEYWORDS: list[str] = [
+    "app",
+    "website",
+    "chatbot",
+    "mobile app",
+    "software",
+    "data",
+    "data analytics",
+    "website widgets",
+    "AI-based",
+    "artificial intelligence",
+    "machine learning",
+    "ML-based",
+    "conversational chatbot",
+    "WhatsApp bot",
+    "telegram bot",
+    "information tools",
+    "automation",
+    "customer service",
+    "customer support",
+    "dashboard",
+    "agents",
+    "multi lingual chatbots",
+    "voice agents",
+    "OCR",
+    "document data extraction",
+    "document management systems",
+    "vision",
+    "surveillance systems",
+    "object detection",
+    "person detection",
+    "face recognition",
+    "social media agents",
+    "multi agentic systems",
+]
+
+
+# Empanelment / expression-of-interest / rate-contract detection. These are
+# kept regardless of IT keywords (the user wants ALL empanelments), so this
+# pattern is applied as an exemption to the keyword filter and used by the
+# dashboard's Empanelments tab. Shared here so pipeline + dashboard agree.
+EMPANELMENT_RE = re.compile(
+    r"empanel|enlist|panel of|rate contract|expression of interest|\bEOI\b|"
+    r"pre[- ]?qualif|\bRFE\b|selection of (?:consultant|agenc|consortium|vendor|partner)",
+    re.IGNORECASE,
+)
+
+
+def is_empanelment(*texts: str) -> bool:
+    return bool(EMPANELMENT_RE.search(" ".join(t for t in texts if t)))
+
+
+def _compile(keyword: str) -> re.Pattern:
+    parts = re.split(r"[\s\-]+", keyword.strip())
+    body = r"[\s\-]+".join(re.escape(p) for p in parts if p)
+    # non-alphanumeric boundaries + optional trailing plural
+    pattern = r"(?<![A-Za-z0-9])" + body + r"s?(?![A-Za-z0-9])"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+class KeywordMatcher:
+    def __init__(self, keywords: list[str] | None = None):
+        self.keywords = keywords if keywords is not None else KEYWORDS
+        self._patterns = [(kw, _compile(kw)) for kw in self.keywords]
+
+    def match(self, *texts: str) -> list[str]:
+        """Return the list of keywords found across the given text fields."""
+        haystack = " ".join(t for t in texts if t)
+        if not haystack:
+            return []
+        hits = [kw for kw, rx in self._patterns if rx.search(haystack)]
+        return hits
+
+    def matches(self, *texts: str) -> bool:
+        return bool(self.match(*texts))
+
+
+def load_keywords(path: str | None) -> list[str]:
+    """Load one keyword per line from a file, or fall back to the built-in list."""
+    if not path:
+        return KEYWORDS
+    with open(path, encoding="utf-8") as fh:
+        kws = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
+    return kws or KEYWORDS
