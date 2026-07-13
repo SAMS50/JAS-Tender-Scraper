@@ -85,6 +85,7 @@ def _parse_row(row) -> dict | None:
         "organization": cells[5].get_text(" ", strip=True),
         "state": "",             # this view exposes Organisation, not State
         "published_date": cells[1].get_text(" ", strip=True),
+        "opening_date": cells[3].get_text(" ", strip=True),   # tender opening
         "closing_date": cells[2].get_text(" ", strip=True),
         "source": "cppp",
         # NOTE: the tendersfullview href is NOT a stable/shareable link. It
@@ -108,90 +109,56 @@ def _total_pages(soup: BeautifulSoup) -> int:
     return max(pages) if pages else 1
 
 
-async def _scrape_page(session, config, sink, page) -> bool | None:
-    """
-    Fetch + parse one listing page. Returns:
-      True  -> page fetched, every row on it was already known from a prior run
-      False -> page fetched and had at least one new/updated row
-      None  -> page failed or was empty/unparseable (never counts toward early-stop)
-    """
+async def _scrape_page(session, config, sink, page) -> None:
+    """Fetch + parse one listing page."""
     url = DATA_URL.format(page=page)
     try:
         html = await fetch(session, "GET", url, config, expect="text")
     except Exception as exc:  # noqa: BLE001
         await sink.emit_error("cppp", f"page:{page}", f"fetch failed: {exc!r}")
-        return None
+        return
 
     # Safety net: never parse a page that turned out to be CAPTCHA-gated.
     if 'name="captchaText"' in html:
         await sink.emit_error("cppp", f"page:{page}", "unexpected captcha on page")
-        return None
+        return
 
     soup = BeautifulSoup(html, "html.parser")
     table = _find_listing_table(soup)
     if table is None:
         await sink.emit_error("cppp", f"page:{page}", "listing table not found")
-        return None
+        return
 
     rows = table.find_all("tr")[1:]
-    if not rows:
-        return None
-
-    all_known = True
     for row in rows:
         try:
             tender = _parse_row(row)
             if not tender:
                 continue
-            # Check BEFORE emit (emit will add it), so this reflects prior runs.
-            if not sink.is_known("cppp", tender["tender_id"]):
-                all_known = False
             await sink.emit(tender)
         except Exception as exc:  # noqa: BLE001
-            all_known = False
             await sink.emit_error("cppp", "unknown", f"row parse failed: {exc!r}")
-    await sink.save_page("cppp", page)
-    return all_known
 
 
 async def scrape_cppp(session, config: ScraperConfig, sink: ResultSink,
                       max_pages: int | None = None) -> None:
-    """
-    CPPP's active-tenders listing is sorted newest-first, so on a resumed run
-    we page sequentially in concurrency-sized batches and stop as soon as an
-    entire batch comes back all-known — everything past that point was already
-    collected last time. A cold/--no-resume run always walks every page.
-    """
+    """Full scan every run: walk every listing page, no early-stop."""
     print("[CPPP] fetching first page to discover pagination ...")
     html = await fetch(session, "GET", FIRST_PAGE, config, expect="text")
     soup = BeautifulSoup(html, "html.parser")
     total_pages = _total_pages(soup)
     if max_pages:
         total_pages = min(total_pages, max_pages)
-    print(f"[CPPP] scraping up to {total_pages:,} pages "
-          f"(~{total_pages * 10:,} tenders){' [incremental]' if config.resume else ''}")
+    print(f"[CPPP] scraping all {total_pages:,} pages "
+          f"(~{total_pages * 10:,} tenders)")
     sink.set_total(total_pages * 10)
 
     sem = asyncio.Semaphore(config.concurrency)
 
-    async def worker(page: int) -> bool | None:
+    async def worker(page: int) -> None:
         async with sem:
-            return await _scrape_page(session, config, sink, page)
+            await _scrape_page(session, config, sink, page)
 
-    batch_size = config.concurrency
-    page = 1
-    while page <= total_pages:
-        batch = list(range(page, min(page + batch_size, total_pages + 1)))
-        results = await asyncio.gather(*(worker(p) for p in batch))
-        # Early-stop as soon as an entire batch (including the first) comes
-        # back all-known from a previous run.
-        checked = [r for r in results if r is not None]
-        if config.resume and checked and all(checked):
-            print(f"[CPPP] pages {batch[0]}-{batch[-1]} were all already "
-                  f"collected -> stopping early (incremental update). "
-                  f"Pass --no-resume for a full rescan.")
-            break
-        page += batch_size
-
+    await asyncio.gather(*(worker(p) for p in range(1, total_pages + 1)))
     await sink.flush()
     print("[CPPP] done.")

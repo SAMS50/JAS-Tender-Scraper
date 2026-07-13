@@ -53,6 +53,7 @@ def _parse_gujarat(row, cfg) -> dict | None:
         "organization": "",  # not exposed in the listing
         "state": "Gujarat",
         "published_date": cells[2].get_text(" ", strip=True),   # pre-bid meeting
+        "opening_date": cells[4].get_text(" ", strip=True),     # opening of bid
         "closing_date": cells[3].get_text(" ", strip=True),     # last date of submission
         "source": "gujarat",
         "source_url": urljoin(cfg["url"], href),

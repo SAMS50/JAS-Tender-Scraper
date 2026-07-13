@@ -42,6 +42,25 @@ TSAP_PORTALS = {
 
 HARD_PAGE_CAP = 500
 
+
+async def _next_enabled(locator) -> bool:
+    try:
+        if await locator.count() == 0:
+            return False
+        handle = await locator.first.element_handle()
+        if handle is None:
+            return False
+        return await handle.evaluate("""el => {
+          const node = el.closest('li, a, button, span') || el;
+          const cls = `${node.className || ''} ${el.className || ''}`.toLowerCase();
+          return !cls.includes('disabled') &&
+                 node.getAttribute('aria-disabled') !== 'true' &&
+                 !node.hasAttribute('disabled');
+        }""")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # JS run in the page to extract the current table's header + rows. We map by
 # HEADER NAME (not fixed index) because TS and AP differ: TS has 10 columns
 # (incl. a Published + Bid-Start pair), AP has 9 (Start + Closing).
@@ -67,6 +86,7 @@ def _colmap(header: list[str]) -> dict:
         "dept": find("department"),
         "id": find("tender id"),
         "notice": find("notice"),
+        "category": find("category"),
         "title": find("name of work", "name of"),
         "closing": find("closing"),
         "published": find("published", "start date"),
@@ -91,7 +111,31 @@ def _row_to_tender(cells: list[str], cm: dict, cfg: dict) -> dict | None:
         "source": cfg["source"],
         "source_url": "",                          # Action is a JS viewBtn(), no URL
         "corrigendum": "",
+        # Raw "Category" column (the APTS portals use PRODUCTS/SERVICES/WORKS);
+        # pipeline.normalize_category maps it, unknown values -> Unidentified.
+        "tender_type": g("category"),
     }
+
+
+async def _set_table_page_size(page, source: str, size: str = "100") -> None:
+    """
+    Best-effort: bump the DataTables page-size dropdown from 10 to `size` so
+    we scrape fewer, bigger pages. Some portals (AP) keep this <select> in the
+    DOM but visually hidden behind a custom-styled widget, which makes
+    Playwright's select_option() wait out its full default timeout (60s) for
+    "visible" before giving up — a bug-for-bug 60s stall on every AP run. A
+    short explicit timeout here caps that stall at a few seconds instead.
+    """
+    try:
+        page_size = page.locator("select[name='pagetable13_length']").first
+        if await page_size.count() == 0:
+            print(f"[{source}] page-size selector not found; using portal default.")
+            return
+        await page_size.select_option(size, timeout=5000)
+        await page.wait_for_timeout(2500)
+        print(f"[{source}] set listing page size to {size}.")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{source}] page-size selector not usable (using portal default): {exc.__class__.__name__}")
 
 
 async def scrape_tsap(config: ScraperConfig, sink: ResultSink,
@@ -132,6 +176,7 @@ async def scrape_tsap(config: ScraperConfig, sink: ResultSink,
             else:
                 await page.get_by_text(cfg.get("more_text", "More..."), exact=False).first.click()
             await page.wait_for_timeout(5000)
+            await _set_table_page_size(page, cfg["source"], "100")
         except Exception as exc:  # noqa: BLE001
             await sink.emit_error(cfg["source"], "nav", f"navigation failed: {exc!r}")
             await browser.close()
@@ -153,17 +198,10 @@ async def scrape_tsap(config: ScraperConfig, sink: ResultSink,
             if not tenders or sig == prev_sig:
                 break
             prev_sig = sig
-            # Incremental early-stop: list is newest-first, so once a whole page
-            # is already known from a prior run, everything after is too.
-            all_known = (config.resume
-                         and all(sink.is_known(cfg["source"], t["tender_id"]) for t in tenders))
             sink.set_total(len(tenders))
             for t in tenders:
                 await sink.emit(t)
             total += len(tenders)
-            if all_known:
-                print(f"[{cfg['source']}] page {pageno} all already collected -> stopping early.")
-                break
 
             # Go to next page. The pager is a JS plugin whose "Next" is a plain
             # <a> (id like pagetable13_next); clicking its text advances it, and
@@ -171,7 +209,7 @@ async def scrape_tsap(config: ScraperConfig, sink: ResultSink,
             # above ends the loop.
             try:
                 nxt = page.get_by_text("Next", exact=True).first
-                if await nxt.count() == 0:
+                if not await _next_enabled(nxt):
                     break
                 await nxt.click()
                 await page.wait_for_timeout(2500)
@@ -249,7 +287,7 @@ async def scrape_bpcl(config: ScraperConfig, sink: ResultSink,
             total += len(tenders)
             try:
                 nxt = page.get_by_text("Next...", exact=False).first
-                if await nxt.count() == 0:
+                if not await _next_enabled(nxt):
                     break
                 await nxt.click()
                 await page.wait_for_timeout(2500)
@@ -269,8 +307,68 @@ async def run_playwright_portal(config, sink, key, max_pages=None):
         await scrape_tsap(config, sink, key, max_pages)
     elif key == "bpcl":
         await scrape_bpcl(config, sink, max_pages)
+    elif key == "bihar":
+        await scrape_bihar(config, sink, max_pages)
     else:
         print(f"[{key}] not a Playwright portal.")
 
 
-PLAYWRIGHT_PORTALS = ["telangana", "andhra_pradesh", "bpcl"]
+# --------------------------------------------------------------------------- Bihar
+# eproc2.bihar.gov.in is a JS app; its REST endpoint (rest/openarea/getTenderList)
+# 500s outside a real browser session, so we read the rendered table instead.
+# Columns: SL No | Tender/RFQ ID | Tender Description | Reference No | Department
+#          | End Date Time | ...
+BIHAR_URL = ("https://eproc2.bihar.gov.in/EPSV2Web/openarea/"
+             "tenderListingPage.action#latestTenders")
+
+_BIHAR_EXTRACT = """() => {
+  const t = [...document.querySelectorAll('table')]
+      .find(t => /Tender Description/i.test(t.innerText) && t.rows.length > 2);
+  if (!t) return [];
+  return [...t.rows].slice(1).map(r => [...r.cells].map(c => c.innerText.trim()));
+}"""
+
+
+async def scrape_bihar(config: ScraperConfig, sink: ResultSink,
+                       max_pages: int | None = None) -> None:
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print("[bihar] Playwright not installed (see module docstring).")
+        return
+    print("[bihar] launching headless browser ...")
+    total = 0
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        page.set_default_timeout(60000)
+        try:
+            await page.goto(BIHAR_URL, wait_until="domcontentloaded")
+            await page.wait_for_timeout(8000)   # let the Angular app fetch data
+            rows = await page.evaluate(_BIHAR_EXTRACT)
+        except Exception as exc:  # noqa: BLE001
+            await sink.emit_error("bihar", "nav", f"failed: {exc!r}")
+            await browser.close()
+            return
+        for c in rows:
+            if len(c) < 6 or not c[1].strip():
+                continue
+            await sink.emit({
+                "tender_id": c[1].strip(),
+                "title": c[2].strip(),
+                "description": c[3].strip(),      # reference no
+                "organization": c[4].strip(),
+                "state": "Bihar",
+                "published_date": "",
+                "closing_date": c[5].strip(),
+                "source": "bihar",
+                "source_url": "",                  # JS app, no deep link
+                "corrigendum": "",
+            })
+            total += 1
+        sink.set_total(total)
+        await browser.close()
+    await sink.flush()
+    print(f"[bihar] done — {total} tenders.")
+
+PLAYWRIGHT_PORTALS = ["telangana", "andhra_pradesh", "bpcl", "bihar"]

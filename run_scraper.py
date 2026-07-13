@@ -2,19 +2,17 @@
 Combined runner for the government-tender scraper.
 
 Wires the GeM, CPPP, and (stubbed) state-GePNIC modules into one shared
-pipeline that writes a single normalized CSV plus an errors log, with
-checkpoint/resume support across all sources.
+pipeline that writes a single normalized CSV plus an errors log. Every run is
+a full re-scan of every source, every listing page — nothing is skipped based
+on prior-run state, so a repeat run can never silently miss a tender.
 
 Examples
 --------
-    # Everything, resumable, default outputs/ dir
+    # Everything, full scan, default outputs/ dir
     python run_scraper.py --source all
 
     # Just GeM, first 5 pages (quick smoke test)
     python run_scraper.py --source gem --max-pages 5
-
-    # CPPP only, fresh run (ignore checkpoints)
-    python run_scraper.py --source cppp --no-resume
 
     # Inspect a newly-registered state before enabling it
     python run_scraper.py --source state --state telangana --dry-run
@@ -31,6 +29,8 @@ import os
 
 import cppp_scraper
 import gem_scraper
+import infralens_scraper
+import ne_states
 import psu_portals
 import state_gepnic_scraper as gepnic
 import state_portals
@@ -49,8 +49,28 @@ def build_config(args) -> ScraperConfig:
         rate_limit=args.rate_limit,
         checkpoint_every=args.checkpoint_every,
         out_dir=args.out_dir,
-        resume=not args.no_resume,
     )
+
+
+# At most this many concurrent headless Chromium instances for the Playwright
+# portals — each is a full browser (hundreds of MB), so parallelism is capped
+# far below the HTTP concurrency to stay memory-safe on a laptop.
+PLAYWRIGHT_BROWSERS = 2
+
+
+async def _run_group(sink: ResultSink, name: str, coro) -> None:
+    """
+    Await one source coroutine, containing any crash to that source. A source
+    that dies (e.g. GeM's CSRF page changing shape) is logged to the errors
+    CSV instead of aborting the whole run — with parallel sources this also
+    guarantees one failure can't take down its siblings.
+    """
+    print(f"\n=== {name} ===")
+    try:
+        await coro
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{name}] SOURCE FAILED: {exc!r}")
+        await sink.emit_error(name, "", f"source crashed: {exc!r}")
 
 
 async def run(args) -> None:
@@ -75,48 +95,81 @@ async def run(args) -> None:
             return
 
         want = args.source
-        if want in ("all", "gem"):
-            print("\n=== GeM ===")
+        # Each group is an independent portal (distinct host), so groups can
+        # run concurrently: the sink serializes all writes behind its lock,
+        # dedup is keyed on (source, tender_id), and the shared session caps
+        # total connections at config.concurrency — a host is never hit
+        # HARDER than in a sequential run (sources now share the connection
+        # pool each of them previously had to itself). Order of arrival
+        # doesn't affect the output: every source still walks its full
+        # listing, and the keep-latest dedup rule is date-based, not
+        # arrival-order-based.
+        groups: list[tuple[str, object]] = []
+
+        if want in ("all", "everything", "gem"):
             if matcher is not None:
-                await gem_scraper.scrape_gem_keywords(
+                groups.append(("GeM", gem_scraper.scrape_gem_keywords(
                     session, config, sink, matcher.keywords,
-                    pages_per_keyword=args.gem_pages_per_keyword)
+                    pages_per_keyword=args.gem_pages_per_keyword)))
             else:
-                await gem_scraper.scrape_gem(session, config, sink, args.max_pages)
-        if want in ("all", "cppp"):
-            print("\n=== CPPP ===")
-            await cppp_scraper.scrape_cppp(session, config, sink, args.max_pages)
-        if want in ("all", "states"):
-            print("\n=== State portals (Gujarat, Haryana) ===")
+                groups.append(("GeM", gem_scraper.scrape_gem(
+                    session, config, sink, args.max_pages)))
+        if want in ("all", "everything", "cppp"):
+            groups.append(("CPPP", cppp_scraper.scrape_cppp(
+                session, config, sink, args.max_pages)))
+        if want in ("all", "everything", "states"):
             portals = ([args.state] if args.state
                        else list(state_portals.STATE_ASPNET_PORTALS))
             for key in portals:
-                await state_portals.scrape_state_portal(
-                    session, config, sink, key, args.max_pages)
-        if want in ("all", "psus"):
-            print("\n=== PSU portals (GAIL, Coal India, NTPC, BHEL) ===")
+                if key in state_portals.STATE_ASPNET_PORTALS:
+                    groups.append((f"state:{key}", state_portals.scrape_state_portal(
+                        session, config, sink, key, args.max_pages)))
+            ne_keys = ([args.state] if args.state
+                       else list(ne_states.NE_STATE_PORTALS))
+            for key in ne_keys:
+                if key in ne_states.NE_STATE_PORTALS:
+                    groups.append((f"state:{key}", ne_states.NE_STATE_PORTALS[key](
+                        session, config, sink, args.max_pages)))
+        if want in ("all", "everything", "infralens"):
+            kws = matcher.keywords if matcher is not None else load_keywords(None)
+            groups.append(("Infralens", infralens_scraper.scrape_infralens(
+                session, config, sink, kws, args.max_pages)))
+        if want in ("all", "everything", "psus"):
             psus = ([args.state] if args.state
                     else list(psu_portals.PSU_PORTALS))
             for key in psus:
-                await psu_portals.PSU_PORTALS[key](
-                    session, config, sink, args.max_pages)
-        if want in ("tsap", "playwright"):  # optional: needs Playwright
+                if key in psu_portals.PSU_PORTALS:
+                    groups.append((f"psu:{key}", psu_portals.PSU_PORTALS[key](
+                        session, config, sink, args.max_pages)))
+        if want in ("everything", "tsap", "playwright"):  # optional: needs Playwright
             import playwright_states
-            print("\n=== Playwright portals (TS / AP / BPCL) ===")
             if args.state:
                 keys = [args.state]
             elif want == "tsap":
                 keys = list(playwright_states.TSAP_PORTALS)
             else:
                 keys = playwright_states.PLAYWRIGHT_PORTALS
+            browser_sem = asyncio.Semaphore(PLAYWRIGHT_BROWSERS)
+
+            async def _pw(key: str) -> None:
+                async with browser_sem:
+                    await playwright_states.run_playwright_portal(
+                        config, sink, key, args.max_pages)
+
             for key in keys:
-                await playwright_states.run_playwright_portal(
-                    config, sink, key, args.max_pages)
+                groups.append((f"playwright:{key}", _pw(key)))
         if want in ("gepnic",):  # NIC GePNIC states are CAPTCHA-gated; stub only
-            print("\n=== State GePNIC (stub) ===")
             states = [args.state] if args.state else list(gepnic.STATE_PORTALS)
             for st in states:
-                await gepnic.scrape_state(session, config, sink, st, args.max_pages)
+                groups.append((f"gepnic:{st}", gepnic.scrape_state(
+                    session, config, sink, st, args.max_pages)))
+
+        if args.sequential:
+            for name, coro in groups:
+                await _run_group(sink, name, coro)
+        else:
+            await asyncio.gather(*(_run_group(sink, name, coro)
+                                   for name, coro in groups))
 
         await sink.finalize()
 
@@ -124,12 +177,18 @@ async def run(args) -> None:
 def parse_args():
     p = argparse.ArgumentParser(description="GeM + CPPP + state GePNIC tender scraper")
     p.add_argument("--source",
-                   choices=["all", "gem", "cppp", "states", "psus", "tsap",
-                            "playwright", "gepnic"],
+                   choices=["all", "everything", "gem", "cppp", "states",
+                            "psus", "tsap", "playwright", "gepnic", "infralens"],
                    default="all",
-                   help="which source(s): all | gem | cppp | states "
-                        "(Gujarat/Haryana) | psus (GAIL/CoalIndia/NTPC/BHEL) | "
-                        "tsap (Telangana/AP) | playwright (TS/AP/BPCL) | gepnic (stub)")
+                   help="which source(s): all (every HTTP source) | everything "
+                        "(all + the Playwright portals, one process) | gem | "
+                        "cppp | states (Gujarat/Haryana) | psus "
+                        "(GAIL/CoalIndia/NTPC/BHEL) | tsap (Telangana/AP) | "
+                        "playwright (TS/AP/BPCL/Bihar) | gepnic (stub) | "
+                        "infralens (aggregator)")
+    p.add_argument("--sequential", action="store_true",
+                   help="run sources one after another (legacy behavior) "
+                        "instead of concurrently")
     p.add_argument("--state",
                    help="single portal key for --source states (gujarat|haryana) "
                         "or state name for --source gepnic / --dry-run")
@@ -152,8 +211,6 @@ def parse_args():
     p.add_argument("--out-dir", default=DEFAULT_OUT_DIR,
                    help="output directory (default: tender_scraper/outputs, "
                         "regardless of current working directory)")
-    p.add_argument("--no-resume", action="store_true",
-                   help="ignore existing checkpoints and start fresh")
     return p.parse_args()
 
 
@@ -161,4 +218,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(run(parse_args()))
     except KeyboardInterrupt:
-        print("\nInterrupted. Progress is checkpointed; re-run to resume.")
+        print("\nInterrupted. Already-collected tenders were flushed to CSV; "
+              "re-run to do a fresh full scan.")

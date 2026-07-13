@@ -64,6 +64,26 @@ def _first(doc: dict, key: str, default: str = "") -> str:
     return str(val) if val is not None else default
 
 
+def _gem_tender_type(doc: dict) -> str:
+    """
+    GeM structurally splits the marketplace into Products (goods catalog) and
+    Services, and each bid doc carries that split twice: b_type (0 = goods,
+    1 = services) and b_cat_id (services categories are namespaced
+    "services_*"). Verified live (2026-07-09): perfect agreement between the
+    two over a 200-doc sample spanning goods and services searches. This is
+    the portal's own category — extracted, not guessed from listing text.
+    """
+    b_type = _first(doc, "b_type")
+    if b_type == "1":
+        return "Service"
+    if b_type == "0":
+        return "Product"
+    # Unexpected/missing b_type: hand the raw category id to the pipeline's
+    # normalizer ("services_*" still yields Service; anything else is
+    # Unidentified).
+    return _first(doc, "b_cat_id")
+
+
 def _parse_doc(doc: dict) -> dict:
     """Map a GeM Solr doc into the normalized tender schema."""
     b_id = _first(doc, "b_id")
@@ -86,15 +106,20 @@ def _parse_doc(doc: dict) -> dict:
         # public bid document page for this bid
         "source_url": f"{BASE}/showbidDocument/{b_id}" if b_id else LISTING_PAGE,
         "corrigendum": "",
+        "tender_type": _gem_tender_type(doc),
     }
 
 
 async def _scrape_page(session, config, sink, csrf, page, search_term=""):
-    """Fetch and parse a single listing page of 10 bids."""
-    # Namespace resume checkpoints per search term so keyword runs don't collide.
-    cp_source = "gem" if not search_term else f"gem:{search_term}"
-    if config.resume and sink.is_page_done(cp_source, page):
-        return
+    """
+    Fetch and parse a single listing page of 10 bids. Every page is fetched
+    fresh on every run: GeM's "ongoing bids" result set is not append-only —
+    bids open and close daily, so a page that was fully scraped last run can
+    have entirely different content today. Each keyword's ongoing set is
+    already small (the bidStatusType=ongoing_bids filter keeps it to
+    tens-to-hundreds of hits), so a full fresh scan per keyword per run is
+    cheap and is the only way to catch newly opened/closed bids.
+    """
     postdata = {"page": page,
                 "param": {"searchBid": search_term, "searchType": "fullText"},
                 "filter": ONGOING_FILTER}
@@ -115,7 +140,6 @@ async def _scrape_page(session, config, sink, csrf, page, search_term=""):
         except Exception as exc:  # noqa: BLE001
             await sink.emit_error("gem", _first(doc, "b_bid_number") or _first(doc, "b_id"),
                                   f"parse failed: {exc!r}")
-    await sink.save_page(cp_source, page)
 
 
 async def scrape_gem(session, config: ScraperConfig, sink: ResultSink,

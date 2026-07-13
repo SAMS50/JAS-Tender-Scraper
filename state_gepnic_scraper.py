@@ -209,9 +209,6 @@ async def scrape_state(session, config: ScraperConfig, sink: ResultSink,
     while True:
         if max_pages and page > max_pages:
             break
-        if config.resume and sink.is_page_done(state, page):
-            page += 1
-            continue
         url = base + cfg["listing_endpoint"].format(page=page)
         try:
             html = await fetch(session, "GET", url, config, expect="text")
@@ -243,7 +240,6 @@ async def scrape_state(session, config: ScraperConfig, sink: ResultSink,
                     await sink.emit(tender)
             except Exception as exc:  # noqa: BLE001
                 await sink.emit_error(state, "unknown", f"row parse failed: {exc!r}")
-        await sink.save_page(state, page)
 
         # Or stop when the Next control is disabled.
         if _next_is_disabled(soup):

@@ -7,8 +7,10 @@ tender dicts:
 
     - HTTP with retries (exponential backoff) + polite rate limiting
     - 60-worker concurrency (asyncio.Semaphore), shared across all sources
-    - Checkpointing every N rows: atomic CSV rewrite (temp file -> rename) plus a
-      per-source JSON checkpoint of which listing pages are already done
+    - Every run is a full re-scan of every source, every listing page — no
+      source is allowed to skip pages/tenders it thinks it already saw. The
+      only "memory" across runs is the output CSV itself, which is loaded so
+      already-collected rows aren't lost, then rewritten from scratch.
     - Live progress with rolling-average ETA
     - Deduplication on (source, tender_id), keeping the latest corrigendum
     - A separate errors_log.csv for anything that failed to parse
@@ -28,7 +30,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from keywords import is_empanelment
+from keywords import EMPANELMENT_KEYWORDS, KeywordMatcher, is_empanelment
 
 import aiohttp
 
@@ -40,15 +42,45 @@ FIELDS = [
     "organization",
     "state",
     "published_date",
+    "opening_date",  # bid-opening date where the listing exposes it; else blank
     "closing_date",
     "source",        # gem / cppp / <state name>
     "source_url",
     "corrigendum",   # marker used for keep-latest dedup; blank if none
     "matched_keywords",  # which target keywords this tender matched (if filtering)
     "is_empanelment",    # "1" if empanelment/EOI/rate-contract, else ""
+    "tender_type",       # Service / Product / Works / Unidentified — extracted
+                         # from the portal's own category data only, never
+                         # inferred from title/description text
 ]
 
+# Only tenders floated (published) on/after this date are kept. Rows whose
+# published date is missing or unparseable are KEPT (we can't verify them;
+# dropping would wipe whole sources that don't expose a published date).
+FLOAT_FROM = datetime(2026, 1, 1)
+
 ERROR_FIELDS = ["source", "tender_id", "reason"]
+
+# The only valid tender categories. A tender's category is EXTRACTED from the
+# portal-supplied category value a scraper passes in `tender_type` (e.g. the
+# TS/AP "Category" column, GeM's goods/services bid split). Unknown values are
+# NOT mapped or guessed from listing text: normalize_category() only accepts a
+# value whose tokens literally name one of the three categories; anything else
+# is honestly "Unidentified".
+_CATEGORY_TOKENS = {
+    "service": "Service", "services": "Service",
+    "product": "Product", "products": "Product",
+    "work": "Works", "works": "Works",
+}
+
+
+def normalize_category(raw: Any) -> str:
+    """Map a scraped category value to Service/Product/Works or Unidentified."""
+    for tok in re.split(r"[^a-z]+", str(raw or "").lower()):
+        if tok in _CATEGORY_TOKENS:
+            return _CATEGORY_TOKENS[tok]
+    return "Unidentified"
+
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -63,12 +95,11 @@ class ScraperConfig:
     max_retries: int = 3            # retries per request on network error
     backoff_base: float = 0.5       # exponential backoff base (seconds)
     rate_limit: float = 0.25        # polite delay between requests (~0.2-0.3s)
-    checkpoint_every: int = 20      # flush CSV + checkpoints every N rows
+    checkpoint_every: int = 20      # flush CSV every N rows
     request_timeout: float = 45.0
     out_dir: str = "outputs"
     output_csv: str = "tenders_gem_cppp.csv"
     errors_csv: str = "errors_log.csv"
-    resume: bool = True             # skip pages already in the checkpoint
 
     @property
     def output_path(self) -> str:
@@ -77,16 +108,6 @@ class ScraperConfig:
     @property
     def errors_path(self) -> str:
         return os.path.join(self.out_dir, self.errors_csv)
-
-    @property
-    def seen_ids_path(self) -> str:
-        return os.path.join(self.out_dir, "seen_ids.json")
-
-    def checkpoint_path(self, source: str) -> str:
-        # Sanitize: source may embed a keyword (e.g. "gem:mobile app") and ':'
-        # / spaces are illegal or awkward in Windows filenames.
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", source)
-        return os.path.join(self.out_dir, f"{safe}_checkpoint.json")
 
 
 class RetryableError(Exception):
@@ -185,20 +206,29 @@ class Progress:
 class ResultSink:
     """
     Collects normalized tenders from every source, dedupes them, and handles
-    checkpointing / progress / error logging. Source modules only call:
+    progress / error logging. Source modules only call:
         sink.set_total(n)
         sink.emit(tender_dict)
         sink.emit_error(source, tender_id, reason)
-        sink.save_page(source, page)          # mark a listing page complete
-        sink.is_page_done(source, page)       # for resume
+
+    There is no checkpointing and no "already seen, skip it" logic. Every run
+    re-scans every listing page of every source in full — the only thing
+    carried over between runs is the existing output CSV, preloaded so a
+    tender collected before isn't lost when the CSV is rewritten, but every
+    source still walks its entire listing every time. This is deliberate:
+    early-stopping on a "we've seen this before" signal is exactly what caused
+    tenders to go missing previously (a portal's listing order or ID scheme
+    doesn't have to match our assumptions), so no source is allowed to skip
+    pages or bail out early because of prior-run state.
     """
 
     def __init__(self, config: ScraperConfig, matcher=None):
         self.config = config
-        # Optional KeywordMatcher; when set, tenders from FILTERED_SOURCES that
-        # match no keyword are dropped (silently, not counted as parse errors).
-        # Other sources bypass the filter entirely.
+        # Optional KeywordMatcher; when set, tenders that match no keyword
+        # (and aren't a keyword-matching empanelment) are dropped.
         self.matcher = matcher
+        # Empanelments must match the IT-domain empanelment keyword list.
+        self._emp_matcher = KeywordMatcher(EMPANELMENT_KEYWORDS)
         self.filtered_out = 0
         self.scanned = 0
         os.makedirs(config.out_dir, exist_ok=True)
@@ -206,19 +236,12 @@ class ResultSink:
         # dedup store keyed by (source, tender_id) -> row (only tenders that
         # PASSED the keyword filter, i.e. what ends up in the output CSV)
         self._rows: dict[tuple[str, str], dict[str, str]] = {}
-        # every (source, tender_id) EVER scanned, whether kept or filtered out.
-        # This is what is_known()/early-stop must use: a filtered-out tender is
-        # still "already seen" and must not force a full rescan on every run.
-        self._seen: set[tuple[str, str]] = set()
         self._errors: list[dict[str, str]] = []
         self._since_flush = 0
-        # per-source checkpoints of completed pages
-        self._checkpoints: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
-        # On resume, preload prior results so skipped pages aren't lost when we
-        # atomically rewrite the CSV at the next flush.
-        if config.resume:
-            self._preload_existing()
+        # Preload prior results so a tender collected in an earlier run isn't
+        # lost when we atomically rewrite the CSV at the next flush.
+        self._preload_existing()
 
     def _preload_existing(self) -> None:
         if os.path.exists(self.config.output_path):
@@ -228,7 +251,6 @@ class ResultSink:
                         key = (row.get("source", ""), row.get("tender_id", ""))
                         if key[1]:
                             self._rows[key] = {k: row.get(k, "") for k in FIELDS}
-                            self._seen.add(key)
             except (OSError, csv.Error):
                 pass
         if os.path.exists(self.config.errors_path):
@@ -237,81 +259,48 @@ class ResultSink:
                     self._errors = [dict(r) for r in csv.DictReader(fh)]
             except (OSError, csv.Error):
                 pass
-        if os.path.exists(self.config.seen_ids_path):
-            try:
-                with open(self.config.seen_ids_path, encoding="utf-8") as fh:
-                    data = json.load(fh)
-                for source, ids in data.items():
-                    self._seen.update((source, tid) for tid in ids)
-            except (OSError, json.JSONDecodeError):
-                pass
         if self._rows:
-            print(f"  [resume] loaded {len(self._rows)} existing tenders "
+            print(f"  [preload] loaded {len(self._rows)} existing tenders "
                   f"from {self.config.output_path}")
-        if self._seen:
-            print(f"  [resume] {len(self._seen)} tender IDs known from prior "
-                  f"runs (kept + filtered-out) for incremental early-stop")
+            self._revalidate_preloaded()
 
-    def _write_seen_ids(self) -> None:
-        by_source: dict[str, list[str]] = {}
-        for source, tid in self._seen:
-            by_source.setdefault(source, []).append(tid)
-        _atomic_write_json(self.config.seen_ids_path, by_source)
+    def _revalidate_preloaded(self) -> None:
+        """
+        Re-apply the CURRENT keyword/empanelment/category rules to every
+        preloaded row and evict/re-tag anything that no longer qualifies.
 
-    # ---- checkpoint / resume -------------------------------------------------
-    def _load_checkpoint(self, source: str) -> dict[str, Any]:
-        if source not in self._checkpoints:
-            path = self.config.checkpoint_path(source)
-            if self.config.resume and os.path.exists(path):
-                try:
-                    with open(path, encoding="utf-8") as fh:
-                        data = json.load(fh)
-                except (OSError, json.JSONDecodeError):
-                    data = {}
-            else:
-                data = {}
-            data.setdefault("completed_pages", [])
-            data.setdefault("last_page", 0)
-            # store as set internally for O(1) lookups
-            data["_completed_set"] = set(data["completed_pages"])
-            self._checkpoints[source] = data
-        return self._checkpoints[source]
-
-    def is_page_done(self, source: str, page: int) -> bool:
-        return page in self._load_checkpoint(source)["_completed_set"]
-
-    async def save_page(self, source: str, page: int) -> None:
-        async with self._lock:
-            cp = self._load_checkpoint(source)
-            cp["_completed_set"].add(page)
-            cp["last_page"] = max(cp["last_page"], page)
-
-    def _write_checkpoints(self) -> None:
-        for source, cp in self._checkpoints.items():
-            out = {
-                "last_page": cp["last_page"],
-                "completed_pages": sorted(cp["_completed_set"]),
-            }
-            _atomic_write_json(self.config.checkpoint_path(source), out)
+        emit()'s own eviction (see below) only fires for a tender that gets
+        RE-SCANNED this run — but a tender that has since closed or fallen off
+        a search-driven source's result set (GeM) is never re-scanned at all,
+        so without this pass a row that matched under an OLD keyword list
+        could never be removed, even after the list changes and the run
+        otherwise completes normally.
+        """
+        dropped = 0
+        for key, row in list(self._rows.items()):
+            row["tender_type"] = normalize_category(row.get("tender_type"))
+            emp_hits = []
+            if is_empanelment(row.get("title", ""), row.get("description", "")):
+                emp_hits = self._emp_matcher.match(row.get("title", ""),
+                                                    row.get("description", ""),
+                                                    row.get("organization", ""))
+            row["is_empanelment"] = "1" if emp_hits else ""
+            if self.matcher is not None:
+                hits = self.matcher.match(row.get("title", ""),
+                                          row.get("description", ""),
+                                          row.get("organization", ""))
+                if not hits and not emp_hits:
+                    del self._rows[key]
+                    dropped += 1
+                    continue
+                row["matched_keywords"] = "; ".join(hits or emp_hits)
+        if dropped:
+            print(f"  [preload] re-validated against current rules: "
+                  f"{dropped} row(s) no longer match and were dropped")
 
     # ---- results -------------------------------------------------------------
     def set_total(self, total: int) -> None:
         self.progress.set_total(total)
-
-    def is_known(self, source: str, tender_id: str) -> bool:
-        """
-        True if this tender was already SCANNED in a prior run — whether it was
-        kept or dropped by the keyword filter. Sources whose listings are
-        sorted newest-first can use this to stop paginating as soon as a page
-        comes back all-known, turning a repeat run into a fetch of just the new
-        tenders instead of a full rescan. (Checking self._rows alone would be
-        wrong here: a filtered-out tender never lands in self._rows, so it
-        would look "new" forever and defeat early-stop entirely.)
-
-        `tender_id` is normalized the same way emit() cleans it before storing,
-        so callers can pass the raw just-parsed value directly.
-        """
-        return (source, _clean(tender_id)) in self._seen
 
     @staticmethod
     def _is_newer(new: dict[str, str], existing: dict[str, str]) -> bool:
@@ -330,26 +319,47 @@ class ResultSink:
     async def emit(self, tender: dict[str, Any]) -> None:
         row = {k: _clean(tender.get(k, "")) for k in FIELDS}
         key = (row["source"], row["tender_id"])
-        if row["tender_id"]:
-            # Record as "seen" regardless of what happens next, so a
-            # filtered-out tender doesn't look "new" again on the next run.
-            self._seen.add(key)
-        # Empanelments are ALWAYS kept (the user wants every empanelment),
-        # regardless of IT keywords. Flag them so the dashboard can show them
-        # in the Empanelments tab without polluting the IT-only tender tabs.
-        emp = is_empanelment(row["title"], row["description"])
-        row["is_empanelment"] = "1" if emp else ""
+        # Empanelments are kept only when they match the IT-domain empanelment
+        # keyword list (EMPANELMENT_KEYWORDS) — a drug-supply rate contract is
+        # dropped, a software-development empanelment is kept. Flag them so the
+        # dashboard's Empanelments tab can show them without polluting the
+        # IT-only tender tab.
+        emp_hits = []
+        if is_empanelment(row["title"], row["description"]):
+            emp_hits = self._emp_matcher.match(row["title"], row["description"],
+                                               row["organization"])
+        row["is_empanelment"] = "1" if emp_hits else ""
+        # Category: extracted ONLY from the portal-supplied category value the
+        # scraper passed (raw is fine — it's normalized here). Sources with no
+        # category in their scraped details stay "Unidentified"; nothing is
+        # inferred from title/description text.
+        row["tender_type"] = normalize_category(tender.get("tender_type"))
+        # Float-date cutoff: only tenders published on/after FLOAT_FROM. Rows
+        # with no parseable published date are kept (can't verify).
+        pub = _parse_any_date(row["published_date"])
+        if pub is not None and pub < FLOAT_FROM:
+            self.filtered_out += 1
+            self.progress.add_done(1)
+            return
         # Keyword filter (if enabled) — applied to EVERY source. Keep a tender
-        # if it matches an IT/AI keyword OR is an empanelment.
+        # if it matches an IT/AI keyword OR is a keyword-matching empanelment.
         if self.matcher is not None:
             hits = self.matcher.match(row["title"], row["description"],
                                       row["organization"])
             self.scanned += 1
-            if not hits and not emp:
+            if not hits and not emp_hits:
                 self.filtered_out += 1
                 self.progress.add_done(1)  # count scanned-but-dropped as progress
+                # A tender re-scanned this run that no longer matches any
+                # keyword must be EVICTED from a preloaded/previous-run row,
+                # not just skipped — otherwise a keyword-list change (or a
+                # portal edit that removes the matching text) can never
+                # remove a row once it's in the CSV, since every run only
+                # preloads-then-accumulates and nothing else deletes rows.
+                async with self._lock:
+                    self._rows.pop(key, None)
                 return
-            row["matched_keywords"] = "; ".join(hits)
+            row["matched_keywords"] = "; ".join(hits or emp_hits)
         async with self._lock:
             if not row["tender_id"]:
                 self._errors.append({
@@ -360,6 +370,16 @@ class ResultSink:
             existing = self._rows.get(key)
             if existing is None or self._is_newer(row, existing):
                 self._rows[key] = row
+            else:
+                # The kept row may predate a change in the category/keyword
+                # rules (rows carried over from an earlier run's CSV keep
+                # their old values otherwise, since every run preloads then
+                # rewrites). These fields are re-derived from live portal
+                # data on every scan, so refresh them on the row we keep.
+                existing["tender_type"] = row["tender_type"]
+                existing["is_empanelment"] = row["is_empanelment"]
+                if self.matcher is not None:
+                    existing["matched_keywords"] = row["matched_keywords"]
             self._since_flush += 1
             self.progress.add_done(1)
             if self._since_flush >= self.config.checkpoint_every:
@@ -375,13 +395,10 @@ class ResultSink:
     # ---- flushing ------------------------------------------------------------
     def _flush_locked(self) -> None:
         """Assumes self._lock is held."""
-        sorted_rows = sorted(self._rows.values(), key=_closing_date_sort_key,
-                            reverse=True)
+        sorted_rows = sorted(self._rows.values(), key=_urgency_sort_key)
         _atomic_write_csv(self.config.output_path, FIELDS, sorted_rows)
         if self._errors:
             _atomic_write_csv(self.config.errors_path, ERROR_FIELDS, self._errors)
-        self._write_checkpoints()
-        self._write_seen_ids()
         self._since_flush = 0
         self.progress.report()
 
@@ -403,57 +420,88 @@ class ResultSink:
 
 
 # ---- atomic file helpers ----------------------------------------------------
-def _replace_with_retry(tmp: str, path: str, attempts: int = 6) -> None:
+def _write_and_replace_with_retry(path: str, write_fn, attempts: int = 6) -> None:
     """
-    os.replace() with retries for transient Windows file locks.
+    Write to a fresh temp file and atomically replace `path`, retrying the
+    WHOLE write+rename cycle on transient Windows/cloud-sync failures.
 
     Cloud-synced folders (OneDrive, etc.) can briefly hold an exclusive handle
-    on a just-written file while indexing/uploading it, which makes
-    os.replace() raise PermissionError (WinError 5) even though nothing in
-    this process is holding the file open. That's transient (milliseconds to
-    a couple seconds), so retry with backoff instead of crashing the whole run.
+    on a just-written file while indexing/uploading it (PermissionError,
+    WinError 5) — or, worse, whisk the temp file away entirely before the
+    rename runs (FileNotFoundError, WinError 2), because it treated a
+    `*.tmp` file as transient junk. Once the temp file is gone, retrying
+    os.replace() on that same path can never succeed — the fix is to
+    re-create the temp file (a fresh, uniquely-named one each attempt, so a
+    stale one from a failed attempt can't collide) and retry the full cycle.
     """
+    last_exc: Exception | None = None
     for attempt in range(attempts):
+        tmp = f"{path}.{os.getpid()}.{attempt}.tmp"
         try:
+            write_fn(tmp)
             os.replace(tmp, path)
             return
-        except PermissionError:
+        except (PermissionError, FileNotFoundError) as exc:
+            last_exc = exc
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
             if attempt == attempts - 1:
                 raise
             time.sleep(0.2 * (2 ** attempt) + random.uniform(0, 0.1))
+    raise last_exc  # pragma: no cover - loop always returns or raises above
 
 
 def _atomic_write_csv(path: str, fieldnames: list[str],
                       rows: Iterable[dict[str, Any]]) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    _replace_with_retry(tmp, path)  # atomic on the same filesystem
+    rows = list(rows)  # materialize once; write_fn may run more than once
+
+    def write_fn(tmp: str) -> None:
+        with open(tmp, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+    _write_and_replace_with_retry(path, write_fn)
 
 
 def _atomic_write_json(path: str, data: Any) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-    _replace_with_retry(tmp, path)
+    def write_fn(tmp: str) -> None:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+
+    _write_and_replace_with_retry(path, write_fn)
 
 
-# Closing-date formats seen across sources: GeM's ISO timestamp and CPPP's
-# "DD-Mon-YYYY hh:mm AM/PM". Add new formats here as new sources are wired in.
-_CLOSING_DATE_FORMATS = [
-    "%Y-%m-%dT%H:%M:%SZ",   # GeM, e.g. 2025-06-28T19:00:00Z
-    "%d-%b-%Y %I:%M %p",    # CPPP, e.g. 08-Jul-2026 11:00 AM
+# Date formats seen across ALL sources. Every scraper stores dates as the
+# portal renders them; this parser normalizes for the float-date cutoff and
+# the urgency sort. Add new formats here as new sources are wired in.
+_DATE_FORMATS = [
+    "%Y-%m-%dT%H:%M:%SZ",       # GeM               2025-06-28T19:00:00Z
+    "%d-%b-%Y %I:%M %p",        # CPPP, Haryana     08-Jul-2026 11:00 AM
+    "%d/%m/%Y %H:%M:%S",        # Gujarat           10/07/2026 14:00:00
+    "%d/%m/%Y %I:%M %p",        # TS/AP             27/07/2026 04:30 PM
+    "%d-%m-%Y %H:%M",           # Coal India        22-07-2026 11:00
+    "%d-%m-%Y %I:%M:%S %p",     # BHEL              15-07-2026 02:30:00 PM
+    "%d/%m/%Y",                 # NTPC, Daman&Diu   25/07/2026
+    "%d-%m-%Y",                 # Puducherry        30-06-2026
+    "%d %b %Y",                 # Meghalaya         03 Jul 2026
+    "%d - %b - %Y",             # aggregators       06 - Aug - 2026
+    "%A, %B %d, %Y %I:%M:%S %p",  # GAIL            Sunday, July 5, 2026 4:30:00 PM
+    "%A, %B %d, %Y",            # GAIL (date only)
+    "%d-%b-%Y",                 # generic           08-Jul-2026
+    "%Y-%m-%d %H:%M",           # Bihar             2026-07-08 15:00
+    "%d-%m-%Y %I:%M %p",        # generic           08-07-2026 03:00 PM
 ]
 
 
-def _parse_closing_date(value: str) -> datetime | None:
-    value = (value or "").strip()
+def _parse_any_date(value: str) -> datetime | None:
+    value = " ".join((value or "").split()).strip()
     if not value:
         return None
-    for fmt in _CLOSING_DATE_FORMATS:
+    for fmt in _DATE_FORMATS:
         try:
             return datetime.strptime(value, fmt)
         except ValueError:
@@ -461,10 +509,20 @@ def _parse_closing_date(value: str) -> datetime | None:
     return None
 
 
-def _closing_date_sort_key(row: dict[str, str]) -> datetime:
-    # Rows with an unparseable/missing closing date sort last even in
-    # descending order, since datetime.min is the smallest possible key.
-    return _parse_closing_date(row.get("closing_date", "")) or datetime.min
+def _urgency_sort_key(row: dict[str, str]) -> tuple:
+    """
+    Urgency ordering: tenders closest to their closing deadline first.
+      1. Open tenders (closing date >= now), soonest deadline first.
+      2. Rows with no parseable closing date (can't rank them).
+      3. Already-closed tenders, most recently closed first.
+    """
+    dt = _parse_any_date(row.get("closing_date", ""))
+    now = datetime.now()
+    if dt is None:
+        return (1, datetime.min)     # unknown deadline: between open and closed
+    if dt >= now:
+        return (0, dt)               # open: ascending (about-to-close on top)
+    return (2, now - dt)             # closed: smallest gap = most recent first
 
 
 def _clean(value: Any) -> str:

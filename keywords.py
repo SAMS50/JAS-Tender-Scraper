@@ -37,8 +37,8 @@ KEYWORDS: list[str] = [
     "machine learning",
     "ML-based",
     "conversational chatbot",
-    "WhatsApp bot",
-    "telegram bot",
+    "WhatsApp",
+    "telegram",
     "information tools",
     "automation",
     "customer service",
@@ -51,6 +51,7 @@ KEYWORDS: list[str] = [
     "document data extraction",
     "document management systems",
     "vision",
+    "surveillance",
     "surveillance systems",
     "object detection",
     "person detection",
@@ -60,10 +61,10 @@ KEYWORDS: list[str] = [
 ]
 
 
-# Empanelment / expression-of-interest / rate-contract detection. These are
-# kept regardless of IT keywords (the user wants ALL empanelments), so this
-# pattern is applied as an exemption to the keyword filter and used by the
-# dashboard's Empanelments tab. Shared here so pipeline + dashboard agree.
+# Empanelment / expression-of-interest / rate-contract detection. Used to
+# recognize that a notice IS an empanelment; whether it's KEPT is decided by
+# EMPANELMENT_KEYWORDS below (only IT-domain empanelments are wanted).
+# Shared here so pipeline + dashboard agree.
 EMPANELMENT_RE = re.compile(
     r"empanel|enlist|panel of|rate contract|expression of interest|\bEOI\b|"
     r"pre[- ]?qualif|\bRFE\b|selection of (?:consultant|agenc|consortium|vendor|partner)",
@@ -73,6 +74,13 @@ EMPANELMENT_RE = re.compile(
 
 def is_empanelment(*texts: str) -> bool:
     return bool(EMPANELMENT_RE.search(" ".join(t for t in texts if t)))
+
+
+# Domain keywords an empanelment must ALSO match to be kept (user-specified).
+# An empanelment notice about e.g. drug supply or freight forwarders is dropped;
+# one matching the same IT/AI keyword list as regular tenders is kept — the
+# empanelments tab uses the identical KEYWORDS list, not a separate one.
+EMPANELMENT_KEYWORDS: list[str] = KEYWORDS
 
 
 def _compile(keyword: str) -> re.Pattern:
