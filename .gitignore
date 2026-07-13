@@ -1,4 +1,14 @@
-outputs/
+# outputs/ is tracked EXCEPT its regenerable/volatile files, so a fresh clone
+# already has a working dataset for `py dashboard.py` — no scrape required.
+# (The CSV is the sole source of truth across runs — no seen_ids/checkpoint
+# ledger exists anymore; every run is a full re-scan, see pipeline.py.)
+outputs/*
+!outputs/tenders_gem_cppp.csv
+outputs/*.tmp
+outputs/refresh.log
+outputs/errors_log.csv
+outputs/.last_refresh
+
 __pycache__/
 *.pyc
 venv/
