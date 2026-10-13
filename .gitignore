@@ -12,3 +12,17 @@ outputs/.last_refresh
 __pycache__/
 *.pyc
 venv/
+# JAS downloaded tender files
+downloaded_tenders/
+boq_files/
+
+# Generated BOQ datasets
+boq_all_items.csv
+boq_items_enriched.csv
+tender_document_mapping.csv
+
+# Local configuration
+.env
+.env.*
+.venv/
+browser_profile/
