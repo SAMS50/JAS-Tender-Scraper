@@ -29,7 +29,21 @@ from pipeline import ResultSink, ScraperConfig, fetch
 
 BASE = "https://eprocure.gov.in"
 FIRST_PAGE = f"{BASE}/cppp/latestactivetendersnew"
-DATA_URL = f"{BASE}/cppp/latestactivetendersnew/cpppdata?page={{page}}"
+from urllib.parse import quote
+
+def page_url(page):
+    inner_url = (
+        f"{BASE}/cppp/latestactivetendersnew/"
+        f"cpppdata?page={page}"
+    )
+    encoded = base64.b64encode(
+        inner_url.encode("utf-8")
+    ).decode("ascii")
+
+    return (
+        f"{BASE}/cppp/latestactivetendersnew/"
+        f"cpppdata?url={quote(encoded, safe='')}"
+    )
 
 _HEADER_RE = re.compile(r"Title/Ref\.No\./Tender Id", re.I)
 _SEG_SPLIT = "A13h1"
@@ -101,17 +115,23 @@ def _parse_row(row) -> dict | None:
     }
 
 
+
 def _total_pages(soup: BeautifulSoup) -> int:
-    """Read the highest page number from the Drupal pager."""
-    pages = [int(m) for m in re.findall(r"[?&]page=(\d+)",
-                                        " ".join(a.get("href", "")
-                                                 for a in soup.find_all("a")))]
+    """Estimate page count from visible pagination links."""
+    pages = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        matches = re.findall(r"[?&]page=(\d+)", href)
+        pages.extend(int(m) for m in matches)
+
     return max(pages) if pages else 1
+
 
 
 async def _scrape_page(session, config, sink, page) -> None:
     """Fetch + parse one listing page."""
-    url = DATA_URL.format(page=page)
+    url = page_url(page)
     try:
         html = await fetch(session, "GET", url, config, expect="text")
     except Exception as exc:  # noqa: BLE001
@@ -146,9 +166,7 @@ async def scrape_cppp(session, config: ScraperConfig, sink: ResultSink,
     print("[CPPP] fetching first page to discover pagination ...")
     html = await fetch(session, "GET", FIRST_PAGE, config, expect="text")
     soup = BeautifulSoup(html, "html.parser")
-    total_pages = _total_pages(soup)
-    if max_pages:
-        total_pages = min(total_pages, max_pages)
+    total_pages = max_pages if max_pages else _total_pages(soup)
     print(f"[CPPP] scraping all {total_pages:,} pages "
           f"(~{total_pages * 10:,} tenders)")
     sink.set_total(total_pages * 10)
