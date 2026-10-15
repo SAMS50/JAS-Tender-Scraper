@@ -2,84 +2,163 @@
 import csv
 from pathlib import Path
 
-BOQ_FILE = Path("boq_all_items.csv")
-MAPPING_FILE = Path("tender_document_mapping.csv")
-OUTPUT_FILE = Path("boq_items_enriched.csv")
+BASE_DIR = Path(__file__).resolve().parent
 
-with MAPPING_FILE.open("r", encoding="utf-8-sig", newline="") as file:
-    mappings = list(csv.DictReader(file))
+BOQ_FILE = BASE_DIR / "boq_all_items.csv"
+DOCUMENT_MAPPING_FILE = BASE_DIR / "tender_document_mapping.csv"
+TENDER_MAPPING_FILE = BASE_DIR / "tender_zip_mapping.csv"
+OUTPUT_FILE = BASE_DIR / "boq_items_enriched.csv"
 
-boq_lookup = {}
 
-for mapping in mappings:
-    if mapping["document_type"] == "BOQ":
-        filename = mapping["document_filename"].strip().lower()
+def read_csv(path):
+    with path.open("r", encoding="utf-8-sig", newline="") as file:
+        return list(csv.DictReader(file))
 
-        boq_lookup.setdefault(filename, []).append(mapping)
 
-with BOQ_FILE.open("r", encoding="utf-8-sig", newline="") as file:
-    items = list(csv.DictReader(file))
+def normalize(value):
+    return str(value or "").strip().lower()
 
-output_rows = []
 
-for item in items:
-    filename = item["source_file"].strip().lower()
-    matches = boq_lookup.get(filename, [])
+def main():
+    for path in [
+        BOQ_FILE,
+        DOCUMENT_MAPPING_FILE,
+        TENDER_MAPPING_FILE,
+    ]:
+        if not path.exists():
+            print(f"Missing file: {path.name}")
+            return
 
-    row = dict(item)
+    items = read_csv(BOQ_FILE)
+    document_mappings = read_csv(DOCUMENT_MAPPING_FILE)
+    tender_mappings = read_csv(TENDER_MAPPING_FILE)
 
-    row["portal"] = ""
-    row["portal_tnid"] = ""
-    row["zip_filename"] = ""
-    row["mapping_status"] = "unmatched"
+    # Match BOQ filename to its ZIP.
+    boq_lookup = {}
 
-    if len(matches) == 1:
-        match = matches[0]
+    for mapping in document_mappings:
+        if normalize(mapping.get("document_type")) != "boq":
+            continue
 
-        row["portal"] = match["portal"]
-        row["portal_tnid"] = match["portal_tnid"]
-        row["zip_filename"] = match["zip_filename"]
+        filename = normalize(mapping.get("document_filename"))
 
-        if match["tender_id"]:
-            row["tender_id"] = match["tender_id"]
+        if filename:
+            boq_lookup.setdefault(filename, []).append(mapping)
 
-        row["mapping_status"] = "matched"
+    # Match ZIP filename to full tender ID.
+    tender_lookup = {}
 
-    elif len(matches) > 1:
-        row["mapping_status"] = "ambiguous"
+    for mapping in tender_mappings:
+        zip_filename = normalize(mapping.get("zip_filename"))
 
-    output_rows.append(row)
+        if zip_filename:
+            tender_lookup.setdefault(zip_filename, []).append(mapping)
 
-columns = list(items[0].keys()) if items else [
-    "source_file",
-    "tender_id",
-    "sheet",
-    "item_number",
-    "description",
-    "quantity",
-    "unit",
-    "estimated_rate_inr",
-    "estimated_amount_inr",
-]
+    output_rows = []
 
-columns += [
-    "portal",
-    "portal_tnid",
-    "zip_filename",
-    "mapping_status",
-]
+    for item in items:
+        row = dict(item)
 
-with OUTPUT_FILE.open("w", encoding="utf-8-sig", newline="") as file:
-    writer = csv.DictWriter(file, fieldnames=columns)
-    writer.writeheader()
-    writer.writerows(output_rows)
+        row["tender_id"] = ""
+        row["portal"] = ""
+        row["portal_tnid"] = ""
+        row["zip_filename"] = ""
+        row["mapping_status"] = "unmatched"
 
-matched = sum(row["mapping_status"] == "matched" for row in output_rows)
-unmatched = sum(row["mapping_status"] == "unmatched" for row in output_rows)
-ambiguous = sum(row["mapping_status"] == "ambiguous" for row in output_rows)
+        filename = normalize(item.get("source_file"))
+        document_matches = boq_lookup.get(filename, [])
 
-print(f"Total BOQ items: {len(output_rows)}")
-print(f"Matched: {matched}")
-print(f"Unmatched: {unmatched}")
-print(f"Ambiguous: {ambiguous}")
-print(f"Saved to: {OUTPUT_FILE}")
+        if len(document_matches) > 1:
+            row["mapping_status"] = "ambiguous"
+
+        elif len(document_matches) == 1:
+            document = document_matches[0]
+
+            row["portal"] = document.get("portal", "")
+            row["portal_tnid"] = document.get("portal_tnid", "")
+            row["zip_filename"] = document.get("zip_filename", "")
+
+            zip_filename = normalize(row["zip_filename"])
+            tender_matches = tender_lookup.get(zip_filename, [])
+
+            if len(tender_matches) > 1:
+                row["mapping_status"] = "ambiguous"
+
+            elif len(tender_matches) == 1:
+                tender = tender_matches[0]
+
+                document_portal_id = normalize(
+                    document.get("portal_tnid")
+                )
+                tender_portal_id = normalize(
+                    tender.get("portal_tnid")
+                )
+
+                if (
+                    document_portal_id
+                    and tender_portal_id
+                    and document_portal_id != tender_portal_id
+                ):
+                    row["mapping_status"] = "ambiguous"
+
+                elif tender.get("tender_id", "").strip():
+                    row["tender_id"] = tender["tender_id"].strip()
+                    row["mapping_status"] = "matched"
+
+                else:
+                    row["mapping_status"] = "missing_tender_id"
+
+            else:
+                row["mapping_status"] = "missing_tender_id"
+
+        output_rows.append(row)
+
+    columns = list(items[0].keys()) if items else [
+        "source_file",
+        "tender_id",
+        "sheet",
+        "item_number",
+        "description",
+        "quantity",
+        "unit",
+        "estimated_rate_inr",
+        "estimated_amount_inr",
+    ]
+
+    for column in [
+        "portal",
+        "portal_tnid",
+        "zip_filename",
+        "mapping_status",
+    ]:
+        if column not in columns:
+            columns.append(column)
+
+    with OUTPUT_FILE.open(
+        "w", encoding="utf-8-sig", newline=""
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(output_rows)
+
+    statuses = [
+        "matched",
+        "unmatched",
+        "ambiguous",
+        "missing_tender_id",
+    ]
+
+    print(f"\nTotal BOQ items: {len(output_rows)}")
+
+    for status in statuses:
+        count = sum(
+            row["mapping_status"] == status
+            for row in output_rows
+        )
+        print(f"{status}: {count}")
+
+    print(f"\nSaved to: {OUTPUT_FILE.name}")
+
+
+if __name__ == "__main__":
+    main()
