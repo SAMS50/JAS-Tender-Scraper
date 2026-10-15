@@ -13,7 +13,7 @@ TENDER_SELECTOR = 'table#table a[title="View Tender Information"]'
 def wait_for_tender_list(page):
     page.locator(TENDER_SELECTOR).first.wait_for(
         state="visible",
-        timeout=15000
+        timeout=20000
     )
 
 
@@ -27,18 +27,62 @@ def restore_tender_list(page):
         return True
 
     except Exception:
-        print("\nCould not restore the tender list automatically.")
-        print("Please navigate back to Active Tenders.")
-        print("Select Published Date and complete the search CAPTCHA.")
-        input("Once the tender list appears, press ENTER...")
+        print("\nPlease restore the tender list manually:")
+        print("1. Open Active Tenders.")
+        print("2. Select Published Date.")
+        print("3. Complete the search CAPTCHA and click Search.")
+
+        input("Once the results appear, press ENTER...")
 
         try:
             wait_for_tender_list(page)
-            print("Tender list restored.")
             return True
         except PlaywrightTimeoutError:
-            print("Tender list still not detected.")
             return False
+
+
+def download_tender_zip(page):
+    zip_link = page.get_by_text(
+        "Download as zip file", exact=False
+    )
+
+    zip_link.wait_for(state="visible", timeout=20000)
+
+    print("Requesting ZIP download...")
+
+    # A download can begin immediately or after CAPTCHA verification.
+    with page.expect_event("download", timeout=5000) as download_wait:
+        zip_link.click()
+
+    return download_wait.value
+
+
+def download_with_captcha(page):
+    try:
+        return download_tender_zip(page)
+
+    except PlaywrightTimeoutError:
+        print("No immediate download detected.")
+
+        captcha_input = page.locator(
+            'input[type="text"]'
+        )
+
+        if captcha_input.count() > 0:
+            print("CAPTCHA verification may be required.")
+            print("Complete CAPTCHA and click Submit manually.")
+            input("Once back on tender details, press ENTER...")
+
+            zip_link = page.get_by_text(
+                "Download as zip file", exact=False
+            )
+
+            with page.expect_download(timeout=60000) as download_info:
+                zip_link.click()
+
+            return download_info.value
+
+        raise
 
 
 with sync_playwright() as p:
@@ -53,10 +97,8 @@ with sync_playwright() as p:
             timeout=60000
         )
 
-        print("In the browser:")
-        print("1. Open Active Tenders.")
-        print("2. Select Published Date.")
-        print("3. Complete CAPTCHA and click Search.")
+        print("Open Active Tenders, select Published Date,")
+        print("complete the search CAPTCHA and click Search.")
 
         input("\nOnce the tender list appears, press ENTER...")
 
@@ -76,33 +118,11 @@ with sync_playwright() as p:
                 wait_for_tender_list(page)
 
                 links = page.locator(TENDER_SELECTOR)
-                print("Opening tender link:", links.nth(index).inner_text())
+                print("Opening:", links.nth(index).inner_text())
+
                 links.nth(index).click()
-                print("Current page URL:", page.url)
 
-                zip_link = page.get_by_text(
-                    "Download as zip file", exact=False
-                )
-
-                zip_link.wait_for(
-                    state="visible",
-                    timeout=20000
-                )
-
-                print("Opening download CAPTCHA...")
-                zip_link.click()
-
-                print("Complete CAPTCHA and click Submit.")
-                input("Once back on tender details, press ENTER...")
-
-                zip_link = page.get_by_text(
-                    "Download as zip file", exact=False
-                )
-
-                with page.expect_download(timeout=60000) as download_info:
-                    zip_link.click()
-
-                download = download_info.value
+                download = download_with_captcha(page)
 
                 destination = (
                     DOWNLOAD_FOLDER / download.suggested_filename
@@ -116,19 +136,15 @@ with sync_playwright() as p:
 
                 successful += 1
 
-            except PlaywrightTimeoutError:
-                print(f"Timeout on tender {index + 1}.")
-
             except Exception as error:
                 print(f"Error on tender {index + 1}: {error}")
 
             if index < total - 1:
                 if not restore_tender_list(page):
-                    print("Stopping because tender list is unavailable.")
+                    print("Could not restore tender list.")
                     break
 
-        print("\nBatch finished!")
-        print(f"Successfully processed: {successful}/{total}")
+        print(f"\nBatch finished: {successful}/{total}")
 
     finally:
         input("\nPress ENTER to close browser...")
