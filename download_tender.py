@@ -17,16 +17,24 @@ def wait_for_tender_list(page):
     )
 
 
+
 def restore_tender_list(page):
     try:
-        page.get_by_role("button", name="Back", exact=True).last.click(
-            timeout=5000
-        )
+        print("Returning to tender list automatically...")
+
+        back_link = page.locator('a[title="Back"]').last
+
+        back_link.wait_for(state="visible", timeout=10000)
+        back_link.click(timeout=15000)
+
         wait_for_tender_list(page)
-        print("Returned to tender list automatically.")
+
+        print("Returned to tender list successfully!")
         return True
 
-    except Exception:
+    except Exception as error:
+        print(f"Automatic navigation failed: {error}")
+
         print("\nPlease restore the tender list manually:")
         print("1. Open Active Tenders.")
         print("2. Select Published Date.")
