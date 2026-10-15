@@ -104,6 +104,8 @@ with sync_playwright() as p:
             wait_until="domcontentloaded",
             timeout=60000
         )
+        page.get_by_role("link", name="Active Tenders").click(timeout=20000)
+        page.get_by_text("Published Date", exact=True).click(timeout=10000)
 
         print("Open Active Tenders, select Published Date,")
         print("complete the search CAPTCHA and click Search.")
