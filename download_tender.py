@@ -22,8 +22,8 @@ STATUS_FILE = BASE_DIR / "tender_download_status.csv"
 
 DOWNLOAD_FOLDER.mkdir(exist_ok=True)
 
-MAX_PAGES = 2
-MAX_TENDERS = 20
+MAX_PAGES = 10
+MAX_TENDERS = 100
 
 TENDER_SELECTOR = 'table#table a[title="View Tender Information"]'
 NEXT_SELECTOR = "#loadNext"
