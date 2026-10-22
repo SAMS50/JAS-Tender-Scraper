@@ -217,35 +217,48 @@ def download_tender_zip(page):
     return download_info.value
 
 
+
 def download_with_captcha(page):
-    try:
-        return download_tender_zip(page)
+    zip_link = page.get_by_text(
+        "Download as zip file",
+        exact=False,
+    )
 
-    except PlaywrightTimeoutError:
-        print("No immediate download detected.")
+    for attempt in range(1, 3):
+        try:
+            print(f"Download attempt {attempt}/2...")
 
-        captcha_input = page.locator('input[type="text"]')
-
-        if captcha_input.count() > 0:
-            print("CAPTCHA verification may be required.")
-            print("Complete CAPTCHA and click Submit manually.")
-
-            input("Once back on tender details, press ENTER...")
-
-            zip_link = page.get_by_text(
-                "Download as zip file",
-                exact=False,
-            )
-
-            with page.expect_download(
-                timeout=60000
-            ) as download_info:
+            with page.expect_download(timeout=15000) as download_info:
                 zip_link.click()
 
             return download_info.value
 
-        raise
+        except PlaywrightTimeoutError:
+            print("No download detected within 15 seconds.")
 
+            # Check whether the download link is still available.
+            # If not, the portal may have opened a CAPTCHA
+            # verification page.
+            if zip_link.count() == 0 or not zip_link.is_visible():
+                print("Verification or portal navigation detected.")
+
+                input(
+                    "Complete any CAPTCHA manually and return "
+                    "to Tender Details, then press ENTER..."
+                )
+
+                zip_link = page.get_by_text(
+                    "Download as zip file",
+                    exact=False,
+                )
+
+            elif attempt == 1:
+                print("Download timed out. Retrying once...")
+                page.wait_for_timeout(2000)
+
+    raise RuntimeError(
+        "download_failed: No ZIP download after two attempts."
+    )
 
 def record_tender_mapping(mappings, info, zip_filename):
     match = ZIP_ID_PATTERN.match(zip_filename)
