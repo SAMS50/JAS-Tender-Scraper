@@ -1,5 +1,6 @@
 
 import csv
+from collections import Counter
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,26 +34,28 @@ def main():
     document_mappings = read_csv(DOCUMENT_MAPPING_FILE)
     tender_mappings = read_csv(TENDER_MAPPING_FILE)
 
-    # Match BOQ filename to its ZIP.
+    # Map BOQ filenames to document records.
     boq_lookup = {}
 
-    for mapping in document_mappings:
-        if normalize(mapping.get("document_type")) != "boq":
+    for document in document_mappings:
+        if normalize(document.get("document_type")) != "boq":
             continue
 
-        filename = normalize(mapping.get("document_filename"))
+        filename = normalize(document.get("document_filename"))
 
         if filename:
-            boq_lookup.setdefault(filename, []).append(mapping)
+            boq_lookup.setdefault(filename, []).append(document)
 
-    # Match ZIP filename to full tender ID.
+    # Map ZIP filenames to their known tender IDs.
     tender_lookup = {}
 
-    for mapping in tender_mappings:
-        zip_filename = normalize(mapping.get("zip_filename"))
+    for tender in tender_mappings:
+        zip_filename = normalize(tender.get("zip_filename"))
 
         if zip_filename:
-            tender_lookup.setdefault(zip_filename, []).append(mapping)
+            tender_lookup.setdefault(
+                zip_filename, []
+            ).append(tender)
 
     output_rows = []
 
@@ -81,32 +84,42 @@ def main():
             zip_filename = normalize(row["zip_filename"])
             tender_matches = tender_lookup.get(zip_filename, [])
 
-            if len(tender_matches) > 1:
+            document_id = document.get(
+                "tender_id", ""
+            ).strip()
+
+            # Gather all known tender IDs for this ZIP.
+            candidate_ids = set()
+
+            if document_id:
+                candidate_ids.add(document_id)
+
+            for tender in tender_matches:
+                tender_id = tender.get(
+                    "tender_id", ""
+                ).strip()
+
+                if tender_id:
+                    candidate_ids.add(tender_id)
+
+            # Check for conflicting portal document IDs.
+            portal_ids = {
+                normalize(document.get("portal_tnid"))
+            }
+
+            for tender in tender_matches:
+                portal_ids.add(
+                    normalize(tender.get("portal_tnid"))
+                )
+
+            portal_ids.discard("")
+
+            if len(candidate_ids) > 1 or len(portal_ids) > 1:
                 row["mapping_status"] = "ambiguous"
 
-            elif len(tender_matches) == 1:
-                tender = tender_matches[0]
-
-                document_portal_id = normalize(
-                    document.get("portal_tnid")
-                )
-                tender_portal_id = normalize(
-                    tender.get("portal_tnid")
-                )
-
-                if (
-                    document_portal_id
-                    and tender_portal_id
-                    and document_portal_id != tender_portal_id
-                ):
-                    row["mapping_status"] = "ambiguous"
-
-                elif tender.get("tender_id", "").strip():
-                    row["tender_id"] = tender["tender_id"].strip()
-                    row["mapping_status"] = "matched"
-
-                else:
-                    row["mapping_status"] = "missing_tender_id"
+            elif len(candidate_ids) == 1:
+                row["tender_id"] = next(iter(candidate_ids))
+                row["mapping_status"] = "matched"
 
             else:
                 row["mapping_status"] = "missing_tender_id"
@@ -137,25 +150,37 @@ def main():
     with OUTPUT_FILE.open(
         "w", encoding="utf-8-sig", newline=""
     ) as file:
-        writer = csv.DictWriter(file, fieldnames=columns)
+        writer = csv.DictWriter(
+            file, fieldnames=columns
+        )
         writer.writeheader()
         writer.writerows(output_rows)
 
-    statuses = [
+    counts = Counter(
+        row["mapping_status"]
+        for row in output_rows
+    )
+
+    print("\n" + "=" * 50)
+    print("BOQ LINKING SUMMARY")
+    print("=" * 50)
+
+    print(f"Total BOQ items: {len(output_rows)}")
+
+    for status in [
         "matched",
         "unmatched",
         "ambiguous",
         "missing_tender_id",
-    ]
+    ]:
+        print(f"{status}: {counts[status]}")
 
-    print(f"\nTotal BOQ items: {len(output_rows)}")
+    if output_rows:
+        rate = (
+            counts["matched"] / len(output_rows)
+        ) * 100
 
-    for status in statuses:
-        count = sum(
-            row["mapping_status"] == status
-            for row in output_rows
-        )
-        print(f"{status}: {count}")
+        print(f"Matching rate: {rate:.2f}%")
 
     print(f"\nSaved to: {OUTPUT_FILE.name}")
 
