@@ -16,7 +16,7 @@ BASE = Path(__file__).resolve().parent
 ZIP_DIR = BASE / "downloaded_tenders"
 OUTPUT = BASE / "tender_eligibility.json"
 
-# Only process these two ZIPs for testing.
+# Controlled test: only these two tenders.
 TEST_ZIPS = [
     "work_341915.zip",
     "work_343127.zip",
@@ -42,7 +42,7 @@ MONEY_RE = (
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# GENERAL HELPERS
 # ============================================================
 
 def clean(text):
@@ -55,7 +55,6 @@ def to_inr(value, unit=None):
 
     if unit.startswith("crore"):
         amount *= 10000000
-
     elif unit.startswith("lakh"):
         amount *= 100000
 
@@ -73,109 +72,131 @@ def load_ids():
             newline="",
             encoding="utf-8-sig",
         ) as file:
+            for row in csv.DictReader(file):
+                name = row.get("zip_filename", "").strip()
+                tender_id = row.get("tender_id", "").strip()
 
-            reader = csv.DictReader(file)
-
-            for row in reader:
-                zip_name = row.get(
-                    "zip_filename", ""
-                ).strip()
-
-                tender_id = row.get(
-                    "tender_id", ""
-                ).strip()
-
-                if zip_name and tender_id:
-                    ids.setdefault(
-                        zip_name, set()
-                    ).add(tender_id)
+                if name and tender_id:
+                    ids.setdefault(name, set()).add(tender_id)
 
     return ids
 
 
+def make_evidence(page, match):
+    """
+    Evidence is taken directly from the PDF text.
+
+    The page number is 1-based, matching the
+    page position in a PDF viewer.
+    """
+    start = max(0, match.start() - 65)
+    end = min(len(page["text"]), match.end() + 100)
+
+    return {
+        "document": page["document"],
+        "page": page["page"],
+        "matched_text": page["text"][
+            match.start():match.end()
+        ],
+        "context": page["text"][start:end],
+    }
+
+
+def find_first(pages, patterns, converter=None):
+    """
+    Search each page independently.
+
+    Returns:
+        (value, evidence)
+
+    This prevents evidence from being attributed
+    to the wrong page.
+    """
+    for page in pages:
+        for pattern in patterns:
+            match = re.search(
+                pattern,
+                page["text"],
+                re.IGNORECASE,
+            )
+
+            if match:
+                if converter:
+                    value = converter(match)
+                else:
+                    value = match.group(0)
+
+                return value, make_evidence(page, match)
+
+    return None, None
+
+
 # ============================================================
-# EXPERIENCE EXTRACTION
+# EXPERIENCE REQUIREMENTS
 # ============================================================
 
-def find_experience_options(text):
+def find_experience_options(pages):
+    patterns = [
+        re.compile(
+            r"\b(Single|One|Two|Three)\s+"
+            r"orders?\s+of\s+value\s+"
+            r"not\s+less\s+than\s+"
+            + MONEY_RE,
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(three|two|one)\s+"
+            r"works?,?\s+each\s+of\s+"
+            + MONEY_RE,
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bone\s+work\s+of\s+"
+            + MONEY_RE,
+            re.IGNORECASE,
+        ),
+    ]
+
     options = []
+    seen = set()
 
-    # NTPC format:
-    # Single order of value not less than Rs 84.01 lakhs
+    for page in pages:
+        for pattern_index, pattern in enumerate(patterns):
+            for match in pattern.finditer(page["text"]):
+                if pattern_index == 2:
+                    count = 1
+                    amount = to_inr(
+                        match.group(1),
+                        match.group(2),
+                    )
+                else:
+                    count = NUMBER_WORDS[
+                        match.group(1).lower()
+                    ]
+                    amount = to_inr(
+                        match.group(2),
+                        match.group(3),
+                    )
 
-    pattern_one = re.compile(
-        r"\b(Single|One|Two|Three)\s+"
-        r"orders?\s+of\s+value\s+"
-        r"not\s+less\s+than\s+"
-        + MONEY_RE,
-        re.IGNORECASE,
-    )
+                key = (count, amount)
 
-    for match in pattern_one.finditer(text):
-        options.append({
-            "number_of_projects": NUMBER_WORDS[
-                match.group(1).lower()
-            ],
-            "minimum_value_each_inr": to_inr(
-                match.group(2),
-                match.group(3),
-            ),
-        })
+                if key in seen:
+                    continue
 
-    # AAI format:
-    # three works, each of ₹2,18,80,886
+                seen.add(key)
 
-    pattern_two = re.compile(
-        r"\b(three|two|one)\s+"
-        r"works?,?\s+each\s+of\s+"
-        + MONEY_RE,
-        re.IGNORECASE,
-    )
+                options.append({
+                    "number_of_projects": count,
+                    "minimum_value_each_inr": amount,
+                    "evidence": make_evidence(
+                        page, match
+                    ),
+                })
 
-    for match in pattern_two.finditer(text):
-        options.append({
-            "number_of_projects": NUMBER_WORDS[
-                match.group(1).lower()
-            ],
-            "minimum_value_each_inr": to_inr(
-                match.group(2),
-                match.group(3),
-            ),
-        })
-
-    # AAI format:
-    # one work of ₹4,37,61,771
-
-    pattern_three = re.compile(
-        r"\bone\s+work\s+of\s+"
-        + MONEY_RE,
-        re.IGNORECASE,
-    )
-
-    for match in pattern_three.finditer(text):
-        options.append({
-            "number_of_projects": 1,
-            "minimum_value_each_inr": to_inr(
-                match.group(1),
-                match.group(2),
-            ),
-        })
-
-    # Remove duplicate experience options.
-    unique = {}
-
-    for option in options:
-        key = (
-            option["number_of_projects"],
-            option["minimum_value_each_inr"],
-        )
-
-        unique[key] = option
-
-    return list(unique.values())
+    return options
 
 
-def find_experience_years(text):
+def find_experience_years(pages):
     patterns = [
         r"(?:last|preceding)\s+07\s*\(seven\)\s+years",
         r"(?:last|preceding)\s+seven\s*\(07\)\s+years",
@@ -183,182 +204,122 @@ def find_experience_years(text):
         r"(?:last|preceding)\s+(\d{1,2})\s+years",
     ]
 
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE,
-        )
+    def convert(match):
+        if match.lastindex:
+            return int(match.group(1))
+        return 7
 
-        if match:
-            if match.lastindex:
-                return int(match.group(1))
-
-            return 7
-
-    return None
+    return find_first(
+        pages, patterns, convert
+    )
 
 
 # ============================================================
-# FINANCIAL ELIGIBILITY
+# FINANCIAL REQUIREMENTS
 # ============================================================
 
-def find_turnover(text):
+def find_turnover(pages):
     patterns = [
-        re.compile(
+        (
             r"average annual turnover.{0,300}?"
             r"not be less than\s+"
-            + MONEY_RE,
-            re.IGNORECASE,
+            + MONEY_RE
         ),
-
-        re.compile(
+        (
             r"Average Annual financial turnover\s+of\s+"
-            + MONEY_RE,
-            re.IGNORECASE,
+            + MONEY_RE
         ),
     ]
 
-    for pattern in patterns:
-        match = pattern.search(text)
+    def convert(match):
+        return to_inr(
+            match.group(1),
+            match.group(2),
+        )
 
-        if match:
-            return to_inr(
-                match.group(1),
-                match.group(2),
-            )
-
-    return None
+    return find_first(
+        pages, patterns, convert
+    )
 
 
-def find_turnover_period(text):
+def find_turnover_period(pages):
     patterns = [
         r"(?:preceding|last)\s+three\s*\(?3\)?\s+(?:financial\s+)?years",
         r"(?:preceding|last)\s+three\s+(?:financial\s+)?years",
         r"(?:preceding|last)\s+3\s+(?:financial\s+)?years",
     ]
 
-    for pattern in patterns:
-        if re.search(
-            pattern,
-            text,
-            re.IGNORECASE,
-        ):
-            return 3
-
-    return None
-
-
-def find_net_worth(text):
-    match = re.search(
-        r"minimum net worth of\s+"
-        + MONEY_RE,
-        text,
-        re.IGNORECASE,
+    return find_first(
+        pages,
+        patterns,
+        lambda match: 3,
     )
 
-    if match:
-        return to_inr(
+
+def find_net_worth(pages):
+    pattern = (
+        r"minimum net worth of\s+"
+        + MONEY_RE
+    )
+
+    return find_first(
+        pages,
+        [pattern],
+        lambda match: to_inr(
             match.group(1),
             match.group(2),
-        )
-
-    return None
+        ),
+    )
 
 
 # ============================================================
-# JOINT VENTURE RULES
+# OTHER ELIGIBILITY CONDITIONS
 # ============================================================
 
-def find_joint_venture_status(text):
-    prohibited = re.search(
+def find_joint_venture(pages):
+    pattern = (
         r"Consortium\s*/\s*JV\s+companies\s+"
-        r"shall\s+not\s+be\s+permitted",
-        text,
-        re.IGNORECASE,
+        r"shall\s+not\s+be\s+permitted"
     )
 
-    if prohibited:
-        return False
-
-    # A mention of JV experience does not prove that
-    # joint venture bidding is allowed.
-    return None
-
-
-# ============================================================
-# SIMILAR WORK DEFINITION
-# ============================================================
-
-def find_similar_work(text):
-    match = re.search(
-        r"Similar Works Meaning:\s*(.*?)"
-        r"(?=For clause no\.|Financial Criteria|$)",
-        text,
-        re.IGNORECASE,
+    return find_first(
+        pages,
+        [pattern],
+        lambda match: False,
     )
 
-    if match:
-        return match.group(1).strip()
 
-    if "Aeronautical Ground Lighting Works" in text:
-        return (
-            "Aeronautical Ground Lighting Works "
-            "including installation of inset fittings"
-        )
+def find_similar_work(pages):
+    patterns = [
+        r"Similar Works Meaning:\s*(.*?)(?=For clause no\.|Financial Criteria|$)",
+        r"Aeronautical Ground Lighting Works\s+"
+        r"which includes installations?\s+of\s+"
+        r"inset fittings",
+    ]
 
-    return ""
+    def convert(match):
+        if match.lastindex:
+            return clean(match.group(1))
+        return clean(match.group(0))
 
-
-# ============================================================
-# ZIP AND PDF PROCESSING
-# ============================================================
-
-def extract_from_zip(zip_name, id_mapping):
-    path = ZIP_DIR / zip_name
-
-    result = {
-        "zip_filename": zip_name,
-        "tender_id": "",
-        "experience_period_years": None,
-        "experience_options": [],
-        "minimum_average_turnover_inr": None,
-        "turnover_period_years": None,
-        "minimum_net_worth_inr": None,
-        "joint_venture_allowed": None,
-        "similar_work_definition": "",
-        "evidence": [],
-        "review_required": True,
-    }
-
-    ids = id_mapping.get(
-        zip_name, set()
+    return find_first(
+        pages, patterns, convert
     )
 
-    if len(ids) == 1:
-        result["tender_id"] = next(
-            iter(ids)
-        )
 
-    elif len(ids) > 1:
-        result["evidence"].append({
-            "warning": "Conflicting tender IDs in mappings"
-        })
+# ============================================================
+# PDF READING
+# ============================================================
 
-    if not path.exists():
-        result["evidence"].append({
-            "warning": "ZIP file not found"
-        })
-        return result
-
+def read_pdf_pages(zip_path):
     pages = []
+    warnings = []
 
-    with ZipFile(path) as archive:
+    with ZipFile(zip_path) as archive:
         for member in archive.namelist():
             if not member.lower().endswith(".pdf"):
                 continue
 
-            # Skip unrelated PDFs.
             if re.search(
                 r"debar|safety.?rules",
                 member,
@@ -372,112 +333,100 @@ def extract_from_zip(zip_name, id_mapping):
                     filetype="pdf",
                 ) as pdf:
 
-                    # Limit to first 12 pages for testing.
-                    for i in range(
-                        min(12, len(pdf))
-                    ):
-                        page_text = clean(
+                    for i in range(min(12, len(pdf))):
+                        text = clean(
                             pdf[i].get_text()
                         )
 
-                        if page_text:
+                        if text:
                             pages.append({
-                                "document": Path(
-                                    member
-                                ).name,
+                                "document": member,
                                 "page": i + 1,
-                                "text": page_text,
+                                "text": text,
                             })
 
             except Exception as error:
-                result["evidence"].append({
-                    "warning": (
-                        f"{member}: {error}"
-                    )
-                })
+                warnings.append(
+                    f"{member}: {error}"
+                )
 
-    combined = " ".join(
-        page["text"]
-        for page in pages
-    )
+    return pages, warnings
 
-    # Extract technical eligibility.
-    result["experience_options"] = (
-        find_experience_options(combined)
-    )
 
-    result["experience_period_years"] = (
-        find_experience_years(combined)
-    )
+# ============================================================
+# MAIN EXTRACTION
+# ============================================================
 
-    result["similar_work_definition"] = (
-        find_similar_work(combined)
-    )
+def extract_from_zip(zip_name, id_mapping):
+    result = {
+        "zip_filename": zip_name,
+        "tender_id": "",
+        "experience_period_years": None,
+        "experience_options": [],
+        "similar_work_definition": "",
+        "minimum_average_turnover_inr": None,
+        "turnover_period_years": None,
+        "minimum_net_worth_inr": None,
+        "joint_venture_allowed": None,
+        "field_evidence": {},
+        "warnings": [],
+        "review_required": True,
+    }
 
-    # Extract financial eligibility.
-    result["minimum_average_turnover_inr"] = (
-        find_turnover(combined)
-    )
+    ids = id_mapping.get(zip_name, set())
 
-    result["minimum_net_worth_inr"] = (
-        find_net_worth(combined)
-    )
-
-    if (
-        result["minimum_average_turnover_inr"]
-        is not None
-    ):
-        result["turnover_period_years"] = (
-            find_turnover_period(combined)
+    if len(ids) == 1:
+        result["tender_id"] = next(iter(ids))
+    elif len(ids) > 1:
+        result["warnings"].append(
+            "Conflicting tender IDs"
         )
 
-    # Extract JV restriction.
-    result["joint_venture_allowed"] = (
-        find_joint_venture_status(combined)
+    zip_path = ZIP_DIR / zip_name
+
+    if not zip_path.exists():
+        result["warnings"].append(
+            "ZIP file not found"
+        )
+        return result
+
+    pages, warnings = read_pdf_pages(zip_path)
+    result["warnings"].extend(warnings)
+
+    extractors = {
+        "experience_period_years": find_experience_years,
+        "similar_work_definition": find_similar_work,
+        "minimum_average_turnover_inr": find_turnover,
+        "turnover_period_years": find_turnover_period,
+        "minimum_net_worth_inr": find_net_worth,
+        "joint_venture_allowed": find_joint_venture,
+    }
+
+    for field, extractor in extractors.items():
+        value, evidence = extractor(pages)
+
+        result[field] = value
+
+        if evidence:
+            result["field_evidence"][field] = evidence
+
+    result["experience_options"] = (
+        find_experience_options(pages)
     )
 
-    # Record relevant source pages.
-    indicators = [
-        "qualifying requirement",
-        "three works",
-        "single order",
-        "average annual",
-        "net worth",
-        "consortium /jv",
-        "similar works meaning",
-    ]
-
-    for page in pages:
-        page_text = page["text"].lower()
-
-        if any(
-            indicator in page_text
-            for indicator in indicators
-        ):
-            result["evidence"].append({
-                "document": page["document"],
-                "page": page["page"],
-            })
-
-    # Keep manual review enabled until
-    # we implement field-level verification.
+    # Never automatically approve an eligibility
+    # decision from regex matches alone.
     result["review_required"] = True
 
     return result
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
     id_mapping = load_ids()
     results = []
 
     for zip_name in TEST_ZIPS:
-        print(
-            f"\nProcessing: {zip_name}"
-        )
+        print(f"\nProcessing: {zip_name}")
 
         result = extract_from_zip(
             zip_name,
