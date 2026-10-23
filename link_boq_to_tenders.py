@@ -1,6 +1,6 @@
 
 import csv
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -12,7 +12,9 @@ OUTPUT_FILE = BASE_DIR / "boq_items_enriched.csv"
 
 
 def read_csv(path):
-    with path.open("r", encoding="utf-8-sig", newline="") as file:
+    with path.open(
+        "r", newline="", encoding="utf-8-sig"
+    ) as file:
         return list(csv.DictReader(file))
 
 
@@ -21,108 +23,97 @@ def normalize(value):
 
 
 def main():
-    for path in [
+    required_files = [
         BOQ_FILE,
         DOCUMENT_MAPPING_FILE,
         TENDER_MAPPING_FILE,
-    ]:
+    ]
+
+    for path in required_files:
         if not path.exists():
-            print(f"Missing file: {path.name}")
+            print(f"ERROR: Missing {path.name}")
             return
 
     items = read_csv(BOQ_FILE)
-    document_mappings = read_csv(DOCUMENT_MAPPING_FILE)
-    tender_mappings = read_csv(TENDER_MAPPING_FILE)
+    documents = read_csv(DOCUMENT_MAPPING_FILE)
+    tenders = read_csv(TENDER_MAPPING_FILE)
 
-    # Map BOQ filenames to document records.
-    boq_lookup = {}
+    # Build a ZIP -> tender ID lookup using both
+    # portal mappings and PDF-recovered document IDs.
+    zip_ids = defaultdict(set)
+    zip_portal_ids = defaultdict(set)
+    zip_portals = defaultdict(set)
 
-    for document in document_mappings:
-        if normalize(document.get("document_type")) != "boq":
+    for record in tenders + documents:
+        zip_name = normalize(record.get("zip_filename"))
+
+        if not zip_name:
             continue
 
-        filename = normalize(document.get("document_filename"))
+        tender_id = str(
+            record.get("tender_id") or ""
+        ).strip()
 
-        if filename:
-            boq_lookup.setdefault(filename, []).append(document)
+        portal_tnid = str(
+            record.get("portal_tnid") or ""
+        ).strip()
 
-    # Map ZIP filenames to their known tender IDs.
-    tender_lookup = {}
+        portal = str(
+            record.get("portal") or ""
+        ).strip()
 
-    for tender in tender_mappings:
-        zip_filename = normalize(tender.get("zip_filename"))
+        if tender_id:
+            zip_ids[zip_name].add(tender_id)
 
-        if zip_filename:
-            tender_lookup.setdefault(
-                zip_filename, []
-            ).append(tender)
+        if portal_tnid:
+            zip_portal_ids[zip_name].add(portal_tnid)
+
+        if portal:
+            zip_portals[zip_name].add(portal)
 
     output_rows = []
 
     for item in items:
         row = dict(item)
 
+        zip_filename = str(
+            item.get("zip_filename") or ""
+        ).strip()
+
+        zip_key = normalize(zip_filename)
+
         row["tender_id"] = ""
         row["portal"] = ""
         row["portal_tnid"] = ""
-        row["zip_filename"] = ""
         row["mapping_status"] = "unmatched"
 
-        filename = normalize(item.get("source_file"))
-        document_matches = boq_lookup.get(filename, [])
+        if not zip_key:
+            output_rows.append(row)
+            continue
 
-        if len(document_matches) > 1:
+        ids = zip_ids.get(zip_key, set())
+        portal_ids = zip_portal_ids.get(zip_key, set())
+        portals = zip_portals.get(zip_key, set())
+
+        if len(portal_ids) == 1:
+            row["portal_tnid"] = next(iter(portal_ids))
+
+        if len(portals) == 1:
+            row["portal"] = next(iter(portals))
+
+        if (
+            len(ids) > 1
+            or len(portal_ids) > 1
+            or len(portals) > 1
+        ):
             row["mapping_status"] = "ambiguous"
 
-        elif len(document_matches) == 1:
-            document = document_matches[0]
+        elif len(ids) == 1:
+            row["tender_id"] = next(iter(ids))
+            row["mapping_status"] = "matched"
 
-            row["portal"] = document.get("portal", "")
-            row["portal_tnid"] = document.get("portal_tnid", "")
-            row["zip_filename"] = document.get("zip_filename", "")
-
-            zip_filename = normalize(row["zip_filename"])
-            tender_matches = tender_lookup.get(zip_filename, [])
-
-            document_id = document.get(
-                "tender_id", ""
-            ).strip()
-
-            # Gather all known tender IDs for this ZIP.
-            candidate_ids = set()
-
-            if document_id:
-                candidate_ids.add(document_id)
-
-            for tender in tender_matches:
-                tender_id = tender.get(
-                    "tender_id", ""
-                ).strip()
-
-                if tender_id:
-                    candidate_ids.add(tender_id)
-
-            # Check for conflicting portal document IDs.
-            portal_ids = {
-                normalize(document.get("portal_tnid"))
-            }
-
-            for tender in tender_matches:
-                portal_ids.add(
-                    normalize(tender.get("portal_tnid"))
-                )
-
-            portal_ids.discard("")
-
-            if len(candidate_ids) > 1 or len(portal_ids) > 1:
-                row["mapping_status"] = "ambiguous"
-
-            elif len(candidate_ids) == 1:
-                row["tender_id"] = next(iter(candidate_ids))
-                row["mapping_status"] = "matched"
-
-            else:
-                row["mapping_status"] = "missing_tender_id"
+        else:
+            row["mapping_status"] = "missing_tender_id"
 
         output_rows.append(row)
 
@@ -136,19 +127,21 @@ def main():
         "unit",
         "estimated_rate_inr",
         "estimated_amount_inr",
+        "zip_filename",
+        "original_filename",
+        "archive_member",
     ]
 
     for column in [
         "portal",
         "portal_tnid",
-        "zip_filename",
         "mapping_status",
     ]:
         if column not in columns:
             columns.append(column)
 
     with OUTPUT_FILE.open(
-        "w", encoding="utf-8-sig", newline=""
+        "w", newline="", encoding="utf-8-sig"
     ) as file:
         writer = csv.DictWriter(
             file, fieldnames=columns
@@ -176,11 +169,11 @@ def main():
         print(f"{status}: {counts[status]}")
 
     if output_rows:
-        rate = (
+        matching_rate = (
             counts["matched"] / len(output_rows)
         ) * 100
 
-        print(f"Matching rate: {rate:.2f}%")
+        print(f"Matching rate: {matching_rate:.2f}%")
 
     print(f"\nSaved to: {OUTPUT_FILE.name}")
 

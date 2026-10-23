@@ -1,39 +1,158 @@
 
+import csv
+import hashlib
+import shutil
 from pathlib import Path
 from zipfile import ZipFile, BadZipFile
 
-ZIP_FOLDER = Path("downloaded_tenders")
-BOQ_FOLDER = Path("boq_files")
+BASE_DIR = Path(__file__).resolve().parent
 
-BOQ_FOLDER.mkdir(exist_ok=True)
+ZIP_FOLDER = BASE_DIR / "downloaded_tenders"
+BOQ_FOLDER = BASE_DIR / "boq_files"
+MANIFEST_FILE = BASE_DIR / "boq_extraction_manifest.csv"
 
-for zip_path in ZIP_FOLDER.glob("*.zip"):
-    print(f"Processing: {zip_path.name}")
+BOQ_FOLDER.mkdir(parents=True, exist_ok=True)
 
-    try:
-        with ZipFile(zip_path) as archive:
-            for member in archive.infolist():
-                filename = Path(member.filename).name
+COLUMNS = [
+    "zip_filename",
+    "original_filename",
+    "archive_member",
+    "extracted_filename",
+    "extracted_path",
+    "status",
+]
 
-                if not filename.lower().endswith(".xls"):
-                    continue
 
-                if not filename.lower().startswith("boq"):
-                    continue
+def safe_name(name):
+    return "".join(
+        c if c.isalnum() or c in "._-" else "_"
+        for c in name
+    )
 
-                if member.is_dir():
-                    continue
 
-                destination = BOQ_FOLDER / filename
+def file_hash(path):
+    digest = hashlib.sha256()
 
-                with archive.open(member) as source:
-                    with destination.open("wb") as output:
-                        while chunk := source.read(1024 * 1024):
-                            output.write(chunk)
+    with path.open("rb") as file:
+        for chunk in iter(
+            lambda: file.read(1024 * 1024), b""
+        ):
+            digest.update(chunk)
 
-                print(f"Extracted: {destination}")
+    return digest.hexdigest()
 
-    except BadZipFile:
-        print(f"Invalid ZIP: {zip_path.name}")
 
-print("\nExtraction complete!")
+def main():
+    records = []
+    extracted = 0
+    unchanged = 0
+    failed = 0
+
+    if not ZIP_FOLDER.exists():
+        print(f"Missing ZIP folder: {ZIP_FOLDER}")
+        return
+
+    for zip_path in sorted(ZIP_FOLDER.glob("*.zip")):
+        print(f"\nProcessing: {zip_path.name}")
+
+        try:
+            with ZipFile(zip_path) as archive:
+                for member in archive.infolist():
+                    if member.is_dir():
+                        continue
+
+                    original_name = Path(
+                        member.filename.replace("\\", "/")
+                    ).name
+
+                    if not (
+                        original_name.lower().startswith("boq")
+                        and original_name.lower().endswith(".xls")
+                    ):
+                        continue
+
+                    # Unique identity includes the ZIP and
+                    # full internal archive member path.
+                    member_hash = hashlib.sha256(
+                        member.filename.encode("utf-8")
+                    ).hexdigest()[:10]
+
+                    extracted_name = (
+                        f"{safe_name(zip_path.stem)}__"
+                        f"{member_hash}__"
+                        f"{safe_name(original_name)}"
+                    )
+
+                    destination = BOQ_FOLDER / extracted_name
+                    temp_path = destination.with_name(
+                        destination.name + ".tmp"
+                    )
+
+                    status = "extracted"
+
+                    try:
+                        with archive.open(member) as source:
+                            with temp_path.open("wb") as output:
+                                shutil.copyfileobj(source, output)
+
+                        if (
+                            destination.exists()
+                            and file_hash(destination)
+                            == file_hash(temp_path)
+                        ):
+                            temp_path.unlink()
+                            status = "unchanged"
+                            unchanged += 1
+                        else:
+                            temp_path.replace(destination)
+                            extracted += 1
+
+                        print(f"{status}: {extracted_name}")
+
+                    except Exception as error:
+                        failed += 1
+                        status = "failed"
+
+                        if temp_path.exists():
+                            temp_path.unlink()
+
+                        print(
+                            f"Extraction failed: "
+                            f"{original_name}: {error}"
+                        )
+
+                    records.append({
+                        "zip_filename": zip_path.name,
+                        "original_filename": original_name,
+                        "archive_member": member.filename,
+                        "extracted_filename": extracted_name,
+                        "extracted_path": str(destination),
+                        "status": status,
+                    })
+
+        except (BadZipFile, OSError) as error:
+            failed += 1
+            print(f"Invalid ZIP: {zip_path.name}: {error}")
+
+    with MANIFEST_FILE.open(
+        "w", newline="", encoding="utf-8-sig"
+    ) as file:
+        writer = csv.DictWriter(
+            file, fieldnames=COLUMNS
+        )
+        writer.writeheader()
+        writer.writerows(records)
+
+    print("\n" + "=" * 50)
+    print("BOQ EXTRACTION SUMMARY")
+    print("=" * 50)
+
+    print(f"New/updated BOQs: {extracted}")
+    print(f"Unchanged BOQs: {unchanged}")
+    print(f"Failed extractions: {failed}")
+    print(f"Manifest records: {len(records)}")
+    print(f"Saved manifest: {MANIFEST_FILE.name}")
+
+
+if __name__ == "__main__":
+    main()
