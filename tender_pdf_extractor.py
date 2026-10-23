@@ -1,60 +1,45 @@
 
 import csv
+import json
 import re
+from collections import Counter
+from decimal import Decimal
 from pathlib import Path
 from zipfile import ZipFile
 
 import pymupdf
 
-BASE = Path(__file__).resolve().parent
-ZIP_DIR = BASE / "downloaded_tenders"
-OUTPUT = BASE / "tender_metadata.csv"
 
-PORTAL_MAPPING = BASE / "tender_zip_mapping.csv"
-DOCUMENT_MAPPING = BASE / "tender_document_mapping.csv"
+ROOT = Path(__file__).resolve().parent
+ZIP_DIR = ROOT / "downloaded_tenders"
 
-# Only these two ZIPs will be processed in this test.
-TEST_ZIPS = ["work_341915.zip", "work_343127.zip"]
+OUTPUT = ROOT / "tender_metadata_batch_v4.csv"
+AUDIT = ROOT / "tender_metadata_v4_audit.json"
 
-ID_PATTERN = re.compile(
-    r"\b20\d{2}_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*_\d+_\d+\b"
-)
+BATCH = [
+    "work_341915.zip",
+    "work_343127.zip",
+    "work_342456.zip",
+    "work_342679.zip",
+    "work_342996.zip",
+    "work_343064.zip",
+    "work_343288.zip",
+    "work_343440.zip",
+    "work_343494.zip",
+    "work_343514.zip",
+    "work_343524.zip",
+    "work_343534.zip",
+    "work_343545.zip",
+    "work_343550.zip",
+    "work_343552.zip",
+    "work_343553.zip",
+    "work_343554.zip",
+    "work_344022.zip",
+    "work_344025.zip",
+    "work_344089.zip",
+]
 
-LABELS = {
-    "tender_title": [
-        r"Name\s+of\s+Work",
-        r"Name\s+of\s+Package",
-    ],
-    "estimated_value_inr": [
-        r"Total\s+Estimated\s+Value",
-        r"Estimated\s+Cost",
-        r"Estimated\s+Value",
-    ],
-    "emd_inr": [
-        r"EMD\s+Amount",
-        r"Earnest\s+Money\s+Deposit",
-    ],
-    "tender_fee_inr": [
-        r"Tender\s+Fee",
-        r"Cost\s+of\s+Tender\s+Document",
-    ],
-    "contract_duration": [
-        r"Contract/Completion\s+Period",
-        r"Time\s+Allowed",
-        r"Completion\s+Period",
-    ],
-}
-
-MONEY_PATTERN = re.compile(
-    r"(?:Rs\.?|INR|₹)\s*([\d,]+(?:\.\d+)?)",
-    re.IGNORECASE,
-)
-
-DURATION_PATTERN = re.compile(
-    r"\b\d+\s*(?:\([^)]*\)\s*)?"
-    r"(?:months?|days?|years?|weeks?)\b",
-    re.IGNORECASE,
-)
+MAX_PAGES = 12
 
 FIELDS = [
     "zip_filename",
@@ -65,359 +50,1339 @@ FIELDS = [
     "organization",
     "tender_title",
     "estimated_value_inr",
+    "estimated_value_basis",
     "emd_inr",
     "tender_fee_inr",
     "contract_duration",
+    "document_tender_reference",
     "eligibility_text",
     "evidence",
+    "financial_candidates",
+    "metadata_fields_found",
+    "metadata_fields_total",
+    "extraction_warnings",
 ]
 
+ORGS = {
+    "NTPC-SAIL Power Company Limited": [
+        "NTPC-SAIL POWER COMPANY",
+    ],
+    "Airports Authority of India": [
+        "AIRPORTS AUTHORITY OF INDIA",
+    ],
+    "Reserve Bank of India": [
+        "RESERVE BANK OF INDIA",
+    ],
+    "GAIL (India) Limited": [
+        "GAIL (INDIA) LIMITED",
+    ],
+    "Oil and Natural Gas Corporation Limited": [
+        "OIL AND NATURAL GAS CORPORATION",
+    ],
+    "Damodar Valley Corporation": [
+        "DAMODAR VALLEY CORPORATION",
+    ],
+    "Municipal Corporation of Delhi": [
+        "MUNICIPAL CORPORATION OF DELHI",
+    ],
+    "Delhi Metro Rail Corporation": [
+        "DELHI METRO RAIL CORPORATION",
+    ],
+}
 
-def clean(text):
-    return re.sub(r"\s+", " ", text).strip()
+ID_RE = re.compile(
+    r"\b20\d{2}_[A-Za-z0-9]+"
+    r"(?:_[A-Za-z0-9]+)*_\d+_\d+\b"
+)
+
+AMOUNT_RE = re.compile(
+    r"(?:₹|Rs\.?|INR)\s*"
+    r"(?P<num>\d[\d,]*(?:\.\d+)?)"
+    r"\s*(?P<unit>lakhs?|lacs?|crores?|cr\.?)?",
+    re.I,
+)
+
+LABELS = {
+    "estimated_value_inr": [
+        r"estimated\s+cost",
+        r"estimated\s+value",
+        r"estimated\s+amount",
+    ],
+    "emd_inr": [
+        r"earnest\s+money\s+deposit",
+        r"\bEMD\s+amount\b",
+        r"\bEMD\s*(?:of|:|-)",
+    ],
+    "tender_fee_inr": [
+        r"tender\s+(?:processing\s+)?fee",
+        r"cost\s+of\s+tender\s+document",
+    ],
+}
+
+TITLE_LABELS = [
+    r"name\s+of\s+(?:the\s+)?work",
+    r"brief\s+description\s+of\s+work",
+    r"name\s+of\s+package",
+    r"scope\s+of\s+(?:supply|procurement)",
+]
+
+TITLE_STOP = re.compile(
+    r"^(?:estimated\s+cost|tender\s+(?:id|no|fee)|"
+    r"emd|earnest\s+money|completion\s+period|"
+    r"date\s+of|notice\s+inviting|"
+    r"invitation\s+for|eligibility|"
+    r"qualifying\s+requirement|"
+    r"important\s+dates|"
+    r"section\s+[ivx\d]+|"
+    r"page\s+\d+|"
+    r"signature|"
+    r"for\s+and\s+on\s+behalf)",
+    re.I,
+)
+
+DURATION_RE = re.compile(
+    r"\b\d+\s*(?:\([^)]*\)\s*)?"
+    r"(?:days?|months?|weeks?|years?)\b",
+    re.I,
+)
 
 
-def load_mapping(path):
-    mapping = {}
+def norm(text):
+    return re.sub(
+        r"\s+", " ", text or ""
+    ).strip()
 
-    if not path.exists():
-        return mapping
 
-    with path.open(
-        newline="", encoding="utf-8-sig"
-    ) as file:
-        for row in csv.DictReader(file):
-            zip_name = row.get("zip_filename", "").strip()
-            if not zip_name:
+def load_mappings():
+    result = {}
+
+    mapping_files = [
+        "tender_zip_mapping.csv",
+        "tender_document_mapping.csv",
+    ]
+
+    for filename in mapping_files:
+        path = ROOT / filename
+
+        if not path.exists():
+            print("Mapping not found:", filename)
+            continue
+
+        with path.open(
+            encoding="utf-8-sig",
+            newline="",
+        ) as file:
+
+            for row in csv.DictReader(file):
+                name = norm(
+                    row.get("zip_filename")
+                )
+
+                if not name:
+                    continue
+
+                entry = result.setdefault(
+                    name,
+                    {
+                        "ids": set(),
+                        "tnids": set(),
+                    },
+                )
+
+                if row.get("tender_id"):
+                    entry["ids"].add(
+                        norm(row["tender_id"])
+                    )
+
+                if row.get("portal_tnid"):
+                    entry["tnids"].add(
+                        norm(row["portal_tnid"])
+                    )
+
+    return result
+
+
+def amount_value(match):
+    value = Decimal(
+        match.group("num").replace(",", "")
+    )
+
+    unit = (
+        match.group("unit") or ""
+    ).lower()
+
+    if unit.startswith(("lakh", "lac")):
+        value *= 100000
+
+    elif unit.startswith(("crore", "cr")):
+        value *= 10000000
+
+    return value.quantize(
+        Decimal("0.01")
+    )
+
+
+def gst_basis(text):
+    text = text.lower()
+
+    if re.search(
+        r"(?:excluding|exclusive\s+of|without)"
+        r"\s+gst",
+        text,
+    ):
+        return "excluding_gst"
+
+    if re.search(
+        r"(?:including|inclusive\s+of|with)"
+        r"\s+gst",
+        text,
+    ):
+        return "including_gst"
+
+    return "unspecified"
+
+
+def period_basis(text):
+    if re.search(
+        r"\b(?:two|2)\s+years?\b",
+        text,
+        re.I,
+    ):
+        return "two_years"
+
+    if re.search(
+        r"\b(?:one|1)\s+years?\b",
+        text,
+        re.I,
+    ):
+        return "one_year"
+
+    return "unspecified"
+
+
+def classify_context(text, field):
+    lower = text.lower()
+
+    if field == "estimated_value_inr":
+
+        if re.search(
+            r"30\s*%\s+of\s+(?:the\s+)?estimated|"
+            r"turnover|financial\s+information|"
+            r"similar\s+work|"
+            r"minimum\s+annual|"
+            r"experience\s+criteria",
+            lower,
+        ):
+            return "eligibility_reference"
+
+    return "tender_financial_candidate"
+
+
+def extract_money(lines, source):
+    candidates = []
+
+    for i, line in enumerate(lines):
+
+        for field, patterns in LABELS.items():
+            label_match = None
+
+            for pattern in patterns:
+                label_match = re.search(
+                    pattern,
+                    line,
+                    re.I,
+                )
+
+                if label_match:
+                    break
+
+            if not label_match:
                 continue
 
-            entry = mapping.setdefault(
-                zip_name, {
-                    "ids": set(),
-                    "portal_tnids": set(),
+            # First search on the same line,
+            # after the financial field label.
+
+            after_label = line[
+                label_match.end():
+            ]
+
+            match = AMOUNT_RE.search(
+                after_label
+            )
+
+            amount_line = line
+
+            # FIX:
+            # PDF tables can put the amount
+            # several lines below its label.
+            #
+            # RBI's EMD is three lines below
+            # "Earnest Money Deposit".
+            #
+            # Search up to four following lines.
+
+            if not match:
+
+                for offset in range(1, 5):
+                    next_index = i + offset
+
+                    if next_index >= len(lines):
+                        break
+
+                    next_line = lines[
+                        next_index
+                    ]
+
+                    # Do not accidentally associate
+                    # another financial field's
+                    # amount with this label.
+
+                    another_label = any(
+                        re.search(
+                            pattern,
+                            next_line,
+                            re.I,
+                        )
+                        for other_patterns
+                        in LABELS.values()
+                        for pattern
+                        in other_patterns
+                    )
+
+                    if another_label:
+                        break
+
+                    match = AMOUNT_RE.search(
+                        next_line
+                    )
+
+                    if match:
+                        amount_line = next_line
+                        break
+
+            if not match:
+                continue
+
+            amount = amount_value(
+                match
+            )
+
+            context = norm(
+                " ".join(
+                    lines[
+                        max(0, i - 1):
+                        min(len(lines), i + 6)
+                    ]
+                )
+            )
+
+            if amount_line == line:
+                clause = after_label
+            else:
+                clause = amount_line
+
+            amount_end = match.end()
+
+            trailing = clause[
+                amount_end:
+                amount_end + 130
+            ]
+
+            local_basis = (
+                clause[:amount_end]
+                + trailing
+            )
+
+            classification = classify_context(
+                context,
+                field,
+            )
+
+            if (
+                field == "estimated_value_inr"
+                and re.search(
+                    r"\b(?:at\s+least|30\s*%|"
+                    r"turnover|financial\s+year)",
+                    context,
+                    re.I,
+                )
+            ):
+                classification = (
+                    "eligibility_reference"
+                )
+
+            candidates.append(
+                {
+                    "field": field,
+                    "value_inr": str(amount),
+                    "gst_basis": gst_basis(
+                        local_basis
+                    ),
+                    "period": period_basis(
+                        local_basis
+                    ),
+                    "classification":
+                        classification,
+                    "document": source[0],
+                    "page": source[1],
+                    "context": context[:550],
                 }
             )
 
-            tender_id = row.get("tender_id", "").strip()
-            portal_tnid = row.get("portal_tnid", "").strip()
+            break
 
-            if tender_id:
-                entry["ids"].add(tender_id)
-
-            if portal_tnid:
-                entry["portal_tnids"].add(portal_tnid)
-
-    return mapping
+    return candidates
 
 
-def extract_labeled_value(lines, patterns, kind):
-    for index, line in enumerate(lines):
-        for pattern in patterns:
+def clean_title(text):
+    text = norm(text)
+
+    text = re.sub(
+        r"^[\s:–—/-]+",
+        "",
+        text,
+    )
+
+    # Remove duplicated GAIL-style
+    # procurement prefixes.
+
+    text = re.sub(
+        r"^(?:PROCUREMENT\s+)+"
+        r"(?=PROCUREMENT\s+OF)",
+        "",
+        text,
+        flags=re.I,
+    )
+
+    text = re.sub(
+        r"\s+(?:estimated\s+cost|"
+        r"tender\s+id|emd\s+amount)"
+        r"\s*[:\-].*$",
+        "",
+        text,
+        flags=re.I,
+    )
+
+    return norm(text)
+
+
+def title_looks_valid(text):
+    if not (
+        25 <= len(text) <= 350
+    ):
+        return False
+
+    if re.match(
+        r"^(goods\s*:|"
+        r"a\s+sum\s+equivalent|"
+        r"payment\s+shall|"
+        r"the\s+contractor)",
+        text,
+        re.I,
+    ):
+        return False
+
+    return True
+
+
+def collect_title(
+    lines,
+    start,
+    initial,
+):
+    pieces = []
+
+    if initial:
+        pieces.append(initial)
+
+    for line in lines[
+        start + 1:
+        start + 8
+    ]:
+
+        if TITLE_STOP.search(line):
+            break
+
+        if not line:
+            break
+
+        if len(
+            norm(" ".join(pieces))
+        ) > 300:
+            break
+
+        if (
+            pieces
+            and pieces[-1]
+            .rstrip()
+            .endswith(".")
+        ):
+            break
+
+        pieces.append(line)
+
+    return clean_title(
+        " ".join(pieces)
+    )
+
+
+def extract_title(lines):
+
+    for i, line in enumerate(
+        lines[:100]
+    ):
+
+        for label in TITLE_LABELS:
+
             match = re.search(
-                pattern + r"\s*[:\-]?\s*",
+                label + r"\s*[:\-]?\s*",
                 line,
-                re.IGNORECASE,
+                re.I,
             )
 
             if not match:
                 continue
 
-            remainder = line[match.end():].strip(" :-")
+            title = collect_title(
+                lines,
+                i,
+                line[
+                    match.end():
+                ],
+            )
 
-            # Some PDFs put the label and value on
-            # separate lines.
-            candidates = [remainder]
-            candidates.extend(lines[index + 1:index + 4])
+            if title_looks_valid(
+                title
+            ):
+                return title
 
-            if kind == "money":
-                for candidate in candidates[:2]:
-                    found = MONEY_PATTERN.search(candidate)
-                    if found:
-                        return found.group(1).replace(",", "")
+    for i, line in enumerate(
+        lines[:35]
+    ):
 
-                # Support amounts without currency symbols,
-                # but only directly beside the label.
-                for candidate in candidates[:2]:
-                    found = re.match(
-                        r"^\s*([\d,]+(?:\.\d+)?)\b",
-                        candidate,
-                    )
-                    if found:
-                        return found.group(1).replace(",", "")
-                    # Only accept a currency-free amount when it
-                    # # appears directly after the field label.
-                    if remainder:
-                        found = re.match(
-                            r"^\s*([\d,]+(?:\.\d+)?)"
-                            r"(?=\s|$|/-)",
-                            remainder,
-                        )
-                        if found:
-                            return found.group(1).replace(",", "")
+        match = re.search(
+            r"(?:TENDER\s+DOCUMENT\s+FOR|"
+            r"FOR\s+PROCUREMENT\s+OF|"
+            r"E-TENDER\s+FOR)"
+            r"\s+(.+)",
+            line,
+            re.I,
+        )
 
-            elif kind == "duration":
-                for candidate in candidates:
-                    found = DURATION_PATTERN.search(candidate)
-                    if found:
-                        return clean(found.group())
+        if match:
 
-            elif kind == "title":
-                title_parts = []
-                if remainder:
-                    title_parts.append(remainder)
+            title = collect_title(
+                lines,
+                i,
+                match.group(1),
+            )
 
-                for following in lines[index + 1:index + 4]:
-                    following = following.strip()
-
-                    if not following:
-                        break
-
-                    if re.search(
-                        r"(?:Tender\s+ID|Estimated\s+Cost|"
-                        r"EMD|Tender\s+Fee|Time\s+Allowed|"
-                        r"Qualifying\s+Requirement)",
-                        following,
-                        re.IGNORECASE,
-                    ):
-                        break
-
-                    title_parts.append(following)
-
-                    # Avoid absorbing unrelated paragraphs.
-                    if len(clean(" ".join(title_parts))) > 180:
-                        break
-
-                if title_parts:
-                    return clean(" ".join(title_parts))
+            if title_looks_valid(
+                title
+            ):
+                return title
 
     return ""
 
 
-def organization_from_text(text):
-    first_lines = [
-        clean(line)
-        for line in text.splitlines()[:18]
-        if clean(line)
+def extract_organization(text):
+    upper = norm(
+        text[:3500]
+    ).upper()
+
+    for name, aliases in ORGS.items():
+
+        if any(
+            alias in upper
+            for alias in aliases
+        ):
+            return name
+
+    return ""
+
+
+def extract_duration(lines):
+    labels = [
+        r"completion\s+period",
+        r"period\s+of\s+contract",
+        r"time\s+allowed",
+        r"contract\s+duration",
     ]
 
-    heading = " ".join(first_lines).upper()
-
-    if "AIRPORTS AUTHORITY OF INDIA" in heading:
-        return "Airports Authority of India"
-
-    if (
-        "NTPC" in heading
-        and "SAIL" in heading
-        and "POWER COMPANY" in heading
+    for i, line in enumerate(
+        lines
     ):
-        return "NTPC-SAIL Power Company Limited"
+
+        for label in labels:
+
+            match = re.search(
+                label,
+                line,
+                re.I,
+            )
+
+            if not match:
+                continue
+
+            segment = " ".join(
+                [line[
+                    match.end():
+                ]]
+                + lines[
+                    i + 1:
+                    i + 2
+                ]
+            )
+
+            duration = DURATION_RE.search(
+                segment
+            )
+
+            if duration:
+                return norm(
+                    duration.group()
+                )
+
+    for line in lines:
+
+        match = re.search(
+            r"(?:completed|completion)"
+            r"\s+within\s+"
+            r"(\d+\s+"
+            r"(?:days?|months?|years?))",
+            line,
+            re.I,
+        )
+
+        if match:
+            return norm(
+                match.group(1)
+            )
 
     return ""
 
 
-def extract_zip(zip_name, portal_map, document_map):
-    row = {field: "" for field in FIELDS}
-    row["zip_filename"] = zip_name
+def resolve_financial(
+    field,
+    candidates,
+):
+    relevant = [
+        item
+        for item in candidates
+        if (
+            item["field"] == field
+            and item["classification"]
+            == "tender_financial_candidate"
+        )
+    ]
 
-    portal = portal_map.get(zip_name, {})
-    document = document_map.get(zip_name, {})
+    if not relevant:
+        return (
+            "",
+            "",
+            "No accepted candidate",
+        )
 
-    portal_ids = portal.get("ids", set())
-    document_ids = document.get("ids", set())
-    portal_tnids = (
-        portal.get("portal_tnids", set())
-        | document.get("portal_tnids", set())
+    grouped = {}
+
+    for item in relevant:
+        grouped.setdefault(
+            item["value_inr"],
+            [],
+        ).append(item)
+
+    if (
+        field == "estimated_value_inr"
+        and len(grouped) > 1
+    ):
+
+        two_year = {
+            value: items
+            for value, items
+            in grouped.items()
+            if any(
+                item["period"]
+                == "two_years"
+                for item in items
+            )
+        }
+
+        one_year_exists = any(
+            item["period"]
+            == "one_year"
+            for item in relevant
+        )
+
+        if (
+            len(two_year) == 1
+            and one_year_exists
+        ):
+            grouped = two_year
+
+    if len(grouped) != 1:
+
+        return (
+            "",
+            "",
+            "Conflicting amounts: "
+            + ", ".join(
+                sorted(grouped)
+            ),
+        )
+
+    value, items = next(
+        iter(grouped.items())
     )
 
-    if len(portal_tnids) == 1:
-        row["portal_tnid"] = next(iter(portal_tnids))
+    explicit_gst = {
+        item["gst_basis"]
+        for item in items
+        if item["gst_basis"]
+        != "unspecified"
+    }
 
-    pdf_ids = set()
+    explicit_period = {
+        item["period"]
+        for item in items
+        if item["period"]
+        != "unspecified"
+    }
+
+    if len(explicit_gst) > 1:
+        return (
+            "",
+            "",
+            "Conflicting GST basis",
+        )
+
+    if len(explicit_period) > 1:
+        return (
+            "",
+            "",
+            "Conflicting contract periods",
+        )
+
+    gst = next(
+        iter(explicit_gst),
+        "unspecified",
+    )
+
+    period = next(
+        iter(explicit_period),
+        "unspecified",
+    )
+
+    return (
+        value,
+        f"{gst};{period}",
+        "",
+    )
+
+
+def process_zip(
+    name,
+    mappings,
+):
+    row = {
+        field: ""
+        for field in FIELDS
+    }
+
+    row["zip_filename"] = name
+
+    warnings = []
+    candidates = []
     evidence = []
+    pdf_ids = set()
 
-    zip_path = ZIP_DIR / zip_name
+    blank_pages = 0
+    readable_pages = 0
 
-    if not zip_path.exists():
-        row["tender_id_status"] = "zip_missing"
-        return row
+    mapping = mappings.get(
+        name,
+        {
+            "ids": set(),
+            "tnids": set(),
+        },
+    )
 
-    with ZipFile(zip_path) as archive:
-        members = [
-            name for name in archive.namelist()
-            if name.lower().endswith(".pdf")
-        ]
+    if len(
+        mapping["tnids"]
+    ) == 1:
 
-        # Prioritize tender and qualification documents.
-        members.sort(
-            key=lambda name: (
-                0 if re.search(
-                    r"tender|nit|qualif|section|other",
-                    name,
-                    re.IGNORECASE,
-                ) else 1,
-                name.lower(),
+        row["portal_tnid"] = next(
+            iter(
+                mapping["tnids"]
             )
         )
 
-        for member in members:
-            filename = Path(member).name
+    if len(
+        mapping["ids"]
+    ) == 1:
 
-            # Ignore generic policy documents for now.
-            if re.search(
-                r"debar|safety.?rules",
-                filename,
-                re.IGNORECASE,
-            ):
-                continue
+        row["tender_id"] = next(
+            iter(
+                mapping["ids"]
+            )
+        )
 
-            try:
-                with pymupdf.open(
-                    stream=archive.read(member),
-                    filetype="pdf",
-                ) as pdf:
+        row["tender_id_source"] = (
+            "mapping"
+        )
 
-                    for page_index in range(min(8, len(pdf))):
-                        text = pdf[page_index].get_text()
+        row["tender_id_status"] = (
+            "mapped"
+        )
 
-                        if not text.strip():
-                            continue
+    elif len(
+        mapping["ids"]
+    ) > 1:
 
-                        lines = [
-                            line.strip()
-                            for line in text.splitlines()
-                        ]
+        row["tender_id_status"] = (
+            "mapping_conflict"
+        )
 
-                        source = (
-                            f"{filename}:page{page_index + 1}"
-                        )
+        warnings.append(
+            "Conflicting mapped tender IDs"
+        )
 
-                        # Capture IDs as candidates.
-                        pdf_ids.update(ID_PATTERN.findall(text))
+    path = ZIP_DIR / name
 
-                        if not row["organization"]:
-                            organization = organization_from_text(text)
-                            if organization:
-                                row["organization"] = organization
-                                evidence.append(
-                                    f"organization={source}"
-                                )
-
-                        for field, kind in [
-                            ("tender_title", "title"),
-                            ("estimated_value_inr", "money"),
-                            ("emd_inr", "money"),
-                            ("tender_fee_inr", "money"),
-                            ("contract_duration", "duration"),
-                        ]:
-                            if row[field]:
-                                continue
-
-                            value = extract_labeled_value(
-                                lines,
-                                LABELS[field],
-                                kind,
-                            )
-
-                            if value:
-                                row[field] = value
-                                evidence.append(
-                                    f"{field}={source}"
-                                )
-
-                        # Capture relevant qualification pages.
-                        if (
-                            "eligibility_text" not in evidence
-                            and (
-                                "qualifying requirement"
-                                in text.lower()
-                                or "technical criteria"
-                                in text.lower()
-                            )
-                        ):
-                            if not row["eligibility_text"]:
-                                row["eligibility_text"] = (
-                                    clean(text)[:3500]
-                                )
-                                evidence.append(
-                                    f"eligibility_text={source}"
-                                )
-
-            except Exception as error:
-                print(f"WARNING: {filename}: {error}")
-
-    # Determine the ID using source priority.
-    if len(portal_ids) > 1 or len(document_ids) > 1:
-        row["tender_id_status"] = "mapping_conflict"
-
-    elif len(portal_ids) == 1:
-        row["tender_id"] = next(iter(portal_ids))
-        row["tender_id_source"] = "portal_mapping"
-
-    elif len(document_ids) == 1:
-        row["tender_id"] = next(iter(document_ids))
-        row["tender_id_source"] = "document_mapping"
-
-    elif len(pdf_ids) == 1:
-        row["tender_id"] = next(iter(pdf_ids))
-        row["tender_id_source"] = "pdf_candidate"
-        row["tender_id_status"] = "needs_review"
+    if not path.exists():
+        warnings.append(
+            "ZIP not found"
+        )
 
     else:
-        row["tender_id_status"] = (
-            "ambiguous_pdf_ids" if pdf_ids
-            else "missing_tender_id"
+        try:
+
+            with ZipFile(
+                path
+            ) as archive:
+
+                members = sorted(
+                    [
+                        member
+                        for member
+                        in archive.namelist()
+                        if member.lower()
+                        .endswith(".pdf")
+                    ],
+                    key=lambda x: (
+                        0
+                        if re.search(
+                            r"tender|nit|qualif",
+                            x,
+                            re.I,
+                        )
+                        else 1,
+                        x.lower(),
+                    ),
+                )
+
+                if not members:
+                    warnings.append(
+                        "No PDF documents"
+                    )
+
+                for member in members:
+
+                    filename = Path(
+                        member
+                    ).name
+
+                    try:
+
+                        data = archive.read(
+                            member
+                        )
+
+                        with pymupdf.open(
+                            stream=data,
+                            filetype="pdf",
+                        ) as pdf:
+
+                            for page_no in range(
+                                min(
+                                    MAX_PAGES,
+                                    len(pdf),
+                                )
+                            ):
+
+                                text = pdf[
+                                    page_no
+                                ].get_text()
+
+                                if not norm(
+                                    text
+                                ):
+                                    blank_pages += 1
+                                    continue
+
+                                readable_pages += 1
+
+                                lines = [
+                                    norm(line)
+                                    for line
+                                    in text.splitlines()
+                                    if norm(line)
+                                ]
+
+                                pdf_ids.update(
+                                    ID_RE.findall(
+                                        text
+                                    )
+                                )
+
+                                source = (
+                                    filename,
+                                    page_no + 1,
+                                )
+
+                                if not row[
+                                    "organization"
+                                ]:
+
+                                    row[
+                                        "organization"
+                                    ] = extract_organization(
+                                        text
+                                    )
+
+                                if (
+                                    not row[
+                                        "tender_title"
+                                    ]
+                                    and page_no < 3
+                                ):
+
+                                    row[
+                                        "tender_title"
+                                    ] = extract_title(
+                                        lines
+                                    )
+
+                                if not row[
+                                    "contract_duration"
+                                ]:
+
+                                    row[
+                                        "contract_duration"
+                                    ] = extract_duration(
+                                        lines
+                                    )
+
+                                candidates.extend(
+                                    extract_money(
+                                        lines,
+                                        source,
+                                    )
+                                )
+
+                                if (
+                                    not row[
+                                        "eligibility_text"
+                                    ]
+                                    and re.search(
+                                        r"qualifying\s+requirements|"
+                                        r"technical\s+criteria",
+                                        text,
+                                        re.I,
+                                    )
+                                ):
+
+                                    row[
+                                        "eligibility_text"
+                                    ] = norm(
+                                        text
+                                    )[:3500]
+
+                    except Exception as error:
+
+                        warnings.append(
+                            f"{filename}: "
+                            f"{error}"
+                        )
+
+        except Exception as error:
+
+            warnings.append(
+                f"ZIP error: {error}"
+            )
+
+    if not row[
+        "tender_id"
+    ]:
+
+        if len(
+            pdf_ids
+        ) == 1:
+
+            row[
+                "tender_id"
+            ] = next(
+                iter(
+                    pdf_ids
+                )
+            )
+
+            row[
+                "tender_id_source"
+            ] = "pdf_candidate"
+
+            row[
+                "tender_id_status"
+            ] = "needs_review"
+
+        elif not row[
+            "tender_id_status"
+        ]:
+
+            row[
+                "tender_id_status"
+            ] = "missing_tender_id"
+
+    if (
+        row["tender_id"]
+        and pdf_ids
+        and row[
+            "tender_id"
+        ] not in pdf_ids
+    ):
+
+        warnings.append(
+            "Mapped/PDF tender ID disagreement"
         )
 
-    if row["tender_id"] and not row["tender_id_status"]:
-        if pdf_ids and row["tender_id"] not in pdf_ids:
-            row["tender_id_status"] = "pdf_disagreement"
-        else:
-            row["tender_id_status"] = "mapped"
+    for field in LABELS:
 
-    if pdf_ids:
-        evidence.append(
-            "pdf_id_candidates=" + "|".join(sorted(pdf_ids))
+        value, basis, warning = (
+            resolve_financial(
+                field,
+                candidates,
+            )
         )
 
-    row["evidence"] = "; ".join(evidence)
+        row[field] = value
+
+        if field == (
+            "estimated_value_inr"
+        ):
+            row[
+                "estimated_value_basis"
+            ] = basis
+
+        if (
+            warning
+            and warning
+            != "No accepted candidate"
+        ):
+
+            warnings.append(
+                f"{field}: "
+                f"{warning}"
+            )
+
+        if value:
+
+            matching = [
+                item
+                for item in candidates
+                if (
+                    item["field"]
+                    == field
+                    and item[
+                        "value_inr"
+                    ] == value
+                )
+            ]
+
+            if matching:
+
+                first = matching[0]
+
+                evidence.append(
+                    f"{field}="
+                    f"{first['document']}:"
+                    f"page{first['page']}"
+                )
+
+    if blank_pages:
+
+        warnings.append(
+            f"{blank_pages} pages "
+            f"without extractable text"
+        )
+
+    if not readable_pages:
+
+        warnings.append(
+            "No readable PDF text"
+        )
+
+    row[
+        "financial_candidates"
+    ] = json.dumps(
+        candidates,
+        ensure_ascii=False,
+    )
+
+    row[
+        "evidence"
+    ] = "; ".join(
+        evidence
+    )
+
+    core = [
+        "organization",
+        "tender_title",
+        "estimated_value_inr",
+        "emd_inr",
+        "tender_fee_inr",
+        "contract_duration",
+    ]
+
+    row[
+        "metadata_fields_found"
+    ] = sum(
+        bool(
+            row[field]
+        )
+        for field in core
+    )
+
+    row[
+        "metadata_fields_total"
+    ] = 6
+
+    row[
+        "extraction_warnings"
+    ] = " | ".join(
+        warnings
+    )
 
     return row
 
 
 def main():
-    portal_map = load_mapping(PORTAL_MAPPING)
-    document_map = load_mapping(DOCUMENT_MAPPING)
+    mappings = load_mappings()
 
-    results = []
+    rows = []
 
-    for zip_name in TEST_ZIPS:
-        print(f"\nProcessing: {zip_name}")
+    print("=" * 65)
+    print(
+        "JAS METADATA EXTRACTION "
+        "- VALIDATION V4"
+    )
+    print("=" * 65)
 
-        result = extract_zip(
-            zip_name,
-            portal_map,
-            document_map,
+    for index, name in enumerate(
+        BATCH,
+        1,
+    ):
+
+        row = process_zip(
+            name,
+            mappings,
         )
-        results.append(result)
 
-        for field in FIELDS:
-            if field in ("eligibility_text", "evidence"):
-                continue
-            print(f"{field}: {result[field]}")
+        rows.append(
+            row
+        )
+
+        print(
+            f"\n[{index}/20] {name}"
+        )
+
+        print(
+            "Tender ID:",
+            row[
+                "tender_id"
+            ] or "MISSING",
+        )
+
+        print(
+            "Organization:",
+            row[
+                "organization"
+            ] or "MISSING",
+        )
+
+        print(
+            "Title:",
+            row[
+                "tender_title"
+            ] or "MISSING",
+        )
+
+        print(
+            "Estimated value:",
+            row[
+                "estimated_value_inr"
+            ] or "REVIEW/MISSING",
+        )
+
+        print(
+            "Basis:",
+            row[
+                "estimated_value_basis"
+            ] or "UNKNOWN",
+        )
+
+        print(
+            "EMD:",
+            row[
+                "emd_inr"
+            ] or "MISSING",
+        )
+
+        print(
+            "Fields:",
+            f"{row['metadata_fields_found']}/6",
+        )
+
+        if row[
+            "extraction_warnings"
+        ]:
+
+            print(
+                "Warnings:",
+                row[
+                    "extraction_warnings"
+                ],
+            )
 
     with OUTPUT.open(
         "w",
         newline="",
         encoding="utf-8-sig",
     ) as file:
+
         writer = csv.DictWriter(
             file,
             fieldnames=FIELDS,
         )
-        writer.writeheader()
-        writer.writerows(results)
 
-    print(f"\nSaved {len(results)} records to {OUTPUT.name}")
+        writer.writeheader()
+        writer.writerows(
+            rows
+        )
+
+    audit = {
+        "version": "v4",
+        "tenders": len(
+            rows
+        ),
+        "field_coverage": {
+            field: sum(
+                bool(
+                    row[field]
+                )
+                for row in rows
+            )
+            for field in [
+                "tender_id",
+                "organization",
+                "tender_title",
+                "estimated_value_inr",
+                "emd_inr",
+                "contract_duration",
+            ]
+        },
+        "records": [
+            {
+                "zip_filename":
+                    row[
+                        "zip_filename"
+                    ],
+                "tender_id":
+                    row[
+                        "tender_id"
+                    ],
+                "estimated_value_inr":
+                    row[
+                        "estimated_value_inr"
+                    ],
+                "estimated_value_basis":
+                    row[
+                        "estimated_value_basis"
+                    ],
+                "warnings":
+                    row[
+                        "extraction_warnings"
+                    ],
+                "financial_candidates":
+                    json.loads(
+                        row[
+                            "financial_candidates"
+                        ]
+                    ),
+            }
+            for row in rows
+        ],
+    }
+
+    AUDIT.write_text(
+        json.dumps(
+            audit,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        "\n" + "=" * 65
+    )
+
+    print(
+        "V4 VALIDATION SUMMARY"
+    )
+
+    print(
+        "=" * 65
+    )
+
+    for field, count in audit[
+        "field_coverage"
+    ].items():
+
+        print(
+            f"{field}: {count}/20"
+        )
+
+    print(
+        "\nID statuses:"
+    )
+
+    statuses = Counter(
+        row[
+            "tender_id_status"
+        ]
+        for row in rows
+    )
+
+    for status, count in sorted(
+        statuses.items()
+    ):
+
+        print(
+            f"  {status}: {count}"
+        )
+
+    print(
+        "\nSaved:",
+        OUTPUT.name,
+    )
+
+    print(
+        "Saved:",
+        AUDIT.name,
+    )
+
+    print(
+        "Original metadata files unchanged."
+    )
 
 
 if __name__ == "__main__":
